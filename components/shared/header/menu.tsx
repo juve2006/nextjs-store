@@ -12,7 +12,7 @@ const Menu = () => {
         <Button asChild
                 variant="ghost">
           <Link href="/cart">
-            <ShoppingCart/> Cart
+            <ShoppingCart className="mr-2"/> Cart
           </Link>
         </Button>
         <Button asChild>
