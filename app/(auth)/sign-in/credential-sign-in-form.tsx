@@ -27,7 +27,6 @@ const CredentialSignInForm = () => {
                  type="password"
                  required={true}
                  autoComplete={'password'}
-                 autoFocus={true}
                  defaultValue={signInDefaultValues.password}/>
         </div>
         <div>
