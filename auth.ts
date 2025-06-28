@@ -1,9 +1,11 @@
+import { authConfig } from './auth.config';
 import NextAuth from 'next-auth';
 import { PrismaAdapter } from '@auth/prisma-adapter';
 import { prisma } from '@/db/prisma';
 import CredentialsProvider from 'next-auth/providers/credentials';
-import { compareSync } from 'bcrypt-ts-edge';
-import type { NextAuthConfig } from 'next-auth';
+import { compareSync } from 'bcrypt-ts-edge';;
+import  { cookies } from 'next/headers';
+import { NextResponse} from 'next/server';
 
 export const config = {
   pages: {
@@ -17,7 +19,7 @@ export const config = {
     // You can still force a JWT session by explicitly defining `"jwt"`.
     // When using `"database"`, the session cookie will only contain a `sessionToken` value,
     // which is used to look up the session in the database.
-    strategy: 'jwt',
+    strategy: 'jwt' as const,
 
     // Seconds - How long until an idle session expires and is no longer valid.
     maxAge: 30 * 24 * 60 * 60, // 30 days
@@ -88,8 +90,9 @@ export const config = {
       }
 
       return token;
-    }
+    },
+    ...authConfig.callbacks,
   },
-} satisfies NextAuthConfig;
+};
 
 export const { handlers, auth, signIn, signOut } = NextAuth(config);
