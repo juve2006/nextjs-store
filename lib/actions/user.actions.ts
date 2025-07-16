@@ -5,7 +5,7 @@ import { signIn, signOut } from '@/auth';
 import { isRedirectError } from 'next/dist/client/components/redirect-error';
 import { hashSync } from 'bcrypt-ts-edge';
 import { prisma } from '@/db/prisma';
-import { formatError } from '@/lib/utils'
+import { formatError } from '@/lib/utils';
 
 export async function signInWithCredentials(prevState: unknown, formData: FormData) {
   try {
@@ -49,13 +49,14 @@ export async function signUpUser(prevState: unknown, formData: FormData) {
         name: user.name,
         email: user.email,
         password: user.password,
-      }
+      },
     });
 
-    await signIn('credentials', {
-      email: user.email,
-      password: plainPassword,
-    });
+    await signIn('credentials',
+      {
+        email: user.email,
+        password: plainPassword,
+      });
 
     return { success: true, message: 'Successfully registered' };
   } catch (error) {
@@ -65,4 +66,15 @@ export async function signUpUser(prevState: unknown, formData: FormData) {
 
     return { success: false, message: formatError(error) };
   }
+}
+
+// get user by id
+export async function getUserById(userId: string) {
+  const user = await prisma.user.findFirst({
+    where: { id: userId },
+  });
+
+  if (!user) throw new Error('User not found');
+
+  return user;
 }

@@ -13,3 +13,11 @@ export const signUpDefaultValues = {
   name: '',
   confirmPassword: '',
 };
+
+export const shippingAddressDefaultValues = {
+  fullName: 'John Wick',
+  streetAddress: '123 Main St.',
+  city: 'Anycity',
+  postalCode: '12345',
+  country: 'USA'
+}
