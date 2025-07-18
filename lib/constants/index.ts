@@ -15,9 +15,9 @@ export const signUpDefaultValues = {
 };
 
 export const shippingAddressDefaultValues = {
-  fullName: 'John Wick',
-  streetAddress: '123 Main St.',
-  city: 'Anycity',
-  postalCode: '12345',
-  country: 'USA'
+  fullName: '',
+  streetAddress: '',
+  city: '',
+  postalCode: '',
+  country: ''
 }
