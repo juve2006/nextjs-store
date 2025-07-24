@@ -1,4 +1,5 @@
 import { auth } from '@/auth';
+import PlaceOrderForm from './place-order-form';
 import { Button } from '@/components/ui/button';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Card, CardContent } from '@/components/ui/card';
@@ -117,6 +118,7 @@ const PlaceOrderPage = async () => {
                 <div> Total </div>
                 <div> {formatCurrency(cart.totalPrice)}</div>
               </div>
+              <PlaceOrderForm />
             </CardContent>
           </Card>
         </div>

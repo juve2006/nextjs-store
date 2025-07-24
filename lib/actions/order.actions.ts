@@ -58,7 +58,7 @@ export async function createOrder() {
     });
 
     // create a transaction to create order and order items in db
-    const insertedOrderId = prisma.$transaction(async (tx) => {
+    const insertedOrderId = await prisma.$transaction(async (tx) => {
       const insertedOrder = await tx.order.create({ data: order });
 
       for (const item of cart.items as CartItem[]) {
