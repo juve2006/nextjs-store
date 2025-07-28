@@ -7,8 +7,11 @@ import { formatCurrency, formatDateTime, formatId } from '@/lib/utils';
 import { Order } from '@/types';
 import Image from 'next/image';
 import Link from 'next/link';
+import { useToast } from '@/hooks/use-toast';
+import { PayPalButtons, PayPalScriptProvider, usePayPalScriptReducer } from '@paypal/react-paypal-js';
+import { createPaypalOrder, approvePaypalOrder } from '@/lib/actions/order.actions';
 
-const OrderDetailsTable = ({ order }: { order: Order }) => {
+const OrderDetailsTable = ({ order, paypalClientId }: { order: Order, paypalClientId: string }) => {
   const {
     id,
     shippingAddress,
@@ -23,6 +26,41 @@ const OrderDetailsTable = ({ order }: { order: Order }) => {
     isPaid,
     deliveredAt,
   } = order;
+
+  const { toast }= useToast();
+
+  const PrintLoadingState = () => {
+    const [{ isPending, isRejected }] = usePayPalScriptReducer();
+    let status = '';
+
+    if (isPending) {
+      status = 'Loading PayPal...';
+    } else if (isRejected) {
+      status = 'Error Loading PayPal';
+    }
+
+    return status;
+  };
+
+  const handleCreatePaypalOrder = async () => {
+    const res = await createPaypalOrder(order.id);
+    if (!res.success) {
+      toast({
+        variant: 'destructive',
+        description: res.message,
+      });
+    }
+
+    return res.data;
+  };
+
+  const handleApprovePaypalOrder = async (data: { orderID: string }) => {
+    const res = await approvePaypalOrder(order.id, data);
+    toast({
+      variant: res.success ? 'default' : 'destructive',
+      description: res.message,
+    });
+  };
 
   return (
     <>
@@ -101,21 +139,30 @@ const OrderDetailsTable = ({ order }: { order: Order }) => {
           <Card>
             <CardContent className="p-4 gap-4 space-y-4">
               <div className="flex justify-between">
-                <div> Items </div>
+                <div> Items</div>
                 <div> {formatCurrency(itemsPrice)}</div>
               </div>
               <div className="flex justify-between">
-                <div> Tax </div>
+                <div> Tax</div>
                 <div> {formatCurrency(taxPrice)}</div>
               </div>
               <div className="flex justify-between">
-                <div> Shipping </div>
+                <div> Shipping</div>
                 <div> {formatCurrency(shippingPrice)}</div>
               </div>
               <div className="flex justify-between">
-                <div> Total </div>
+                <div> Total</div>
                 <div> {formatCurrency(totalPrice)}</div>
               </div>
+              {/* PayPal Payment */}
+              {!isPaid && paymentMethod === 'PayPal'&& (
+                <div>
+                  <PayPalScriptProvider options={{clientId: paypalClientId}}>
+                    <PrintLoadingState />
+                    <PayPalButtons createOrder={handleCreatePaypalOrder} onApprove={handleApprovePaypalOrder}/>
+                  </PayPalScriptProvider>
+                </div>
+              )}
             </CardContent>
           </Card>
         </div>
