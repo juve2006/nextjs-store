@@ -11,6 +11,7 @@ import { isRedirectError } from 'next/dist/client/components/redirect-error';
 import { paypal } from '@/lib/paypal';
 import { revalidatePath } from 'next/cache';
 import { z } from 'zod';
+import { PAGE_SIZE } from '@/lib/constants';
 
 
 // Create order and order items
@@ -249,4 +250,26 @@ async function updateOrderToPaid({ orderId, paymentResult }: { orderId: string, 
     },
   });
   if (!updatedOrder) throw new Error('Order not found');
+}
+
+// get users orders
+export async function getMyOrders({ limit = PAGE_SIZE, page }: { limit?: number, page: number }) {
+  const session = await auth();
+  if (!session) throw new Error('User is not authorized');
+
+  const data = await prisma.order.findMany({
+    where: { userId: session?.user?.id },
+    orderBy: { createdAt: 'desc' },
+    take: limit,
+    skip: (page - 1) * limit,
+  });
+
+  const dataCount = await prisma.order.count({
+    where: { userId: session?.user?.id },
+  });
+
+  return {
+    data,
+    totalPages: Math.ceil(dataCount / limit),
+  };
 }
