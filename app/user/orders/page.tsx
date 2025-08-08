@@ -1,3 +1,4 @@
+import Pagination from '@/components/shared/pagination';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Metadata } from 'next';
 import { getMyOrders } from '@/lib/actions/order.actions';
@@ -12,7 +13,7 @@ export const metadata: Metadata = {
 const OrdersPage = async (props: { searchParams: Promise<{ page: string }> }) => {
   const { page } = await props.searchParams;
 
-  const orders = await getMyOrders({ page: Number(page) || 1 })
+  const orders = await getMyOrders({ page: Number(page) || 1 });
 
   return (
     <div className="space-y-2">
@@ -42,6 +43,11 @@ const OrdersPage = async (props: { searchParams: Promise<{ page: string }> }) =>
             ))}
           </TableBody>
         </Table>
+        {
+          orders.totalPages > 1 && (
+            <Pagination page={Number(page) || 1} total={orders?.totalPages}/>
+          )
+        }
       </div>
     </div>
   );
