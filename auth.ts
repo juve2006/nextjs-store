@@ -4,7 +4,7 @@ import { PrismaAdapter } from '@auth/prisma-adapter';
 import { prisma } from '@/db/prisma';
 import CredentialsProvider from 'next-auth/providers/credentials';
 import { compareSync } from 'bcrypt-ts-edge';
-import  { cookies } from 'next/headers';
+import { cookies } from 'next/headers';
 
 export const config = {
   pages: {
@@ -40,7 +40,8 @@ export const config = {
 
         //Check user and the password matching
         if (user && user.password) {
-          const isMatch = compareSync(credentials.password as string, user.password);
+          const isMatch = compareSync(credentials.password as string,
+            user.password);
 
           //If pass is correct return user
           if (isMatch) {
@@ -85,7 +86,7 @@ export const config = {
           await prisma.user.update({
             where: { id: user.id },
             data: { name: token.name },
-          })
+          });
         }
 
         if (trigger === 'signIn' || trigger === 'signOut') {
@@ -113,6 +114,10 @@ export const config = {
         }
       }
 
+      // handle sessions update
+      if (session?.user?.name && trigger === 'update') {
+        token.name = session.user.name;
+      }
       return token;
     },
     ...authConfig.callbacks,
