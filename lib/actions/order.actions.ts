@@ -201,7 +201,7 @@ export async function approvePaypalOrder(orderId: string,
   }
 }
 
-//update order to paid
+//update order to pay
 async function updateOrderToPaid({ orderId, paymentResult }: { orderId: string, paymentResult?: PaymentResult }) {
   const order = await prisma.order.findFirst({
     where: { id: orderId },
@@ -224,7 +224,7 @@ async function updateOrderToPaid({ orderId, paymentResult }: { orderId: string, 
         },
       });
     }
-    // set order to paid
+    // set order to pay
     await tx.order.update({
       where: { id: orderId },
       data: {
@@ -357,10 +357,63 @@ export async function deleteOrder(orderId: string) {
 
     return {
       success: true,
-      message: 'Order deleted scuccessfully',
+      message: 'Order deleted successfully',
     };
   } catch (error) {
 
+    return {
+      success: false,
+      message: formatError(error),
+    };
+  }
+}
+
+// update COD order to pay
+export async function updateOrderToPaidCOD(orderId: string) {
+  try {
+    await updateOrderToPaid({ orderId });
+
+    revalidatePath(`/order/${orderId}`);
+
+    return {
+      success: true,
+      message: 'Order marked as paid',
+    };
+  } catch (error) {
+    return {
+      success: false,
+      message: formatError(error),
+    };
+  }
+}
+
+// update COD order to delivered
+export async function deliverOrder(orderId: string) {
+  try {
+    const order = await prisma.order.findFirst({
+      where: {
+        id: orderId,
+      },
+    });
+
+    if (!order) throw new Error('Order not found');
+    if (!order?.isPaid) throw new Error('Order is not paid');
+
+    await prisma.order.update({
+      where: { id: orderId },
+      data: {
+        isDelivered: true,
+        deliveredAt: new Date(),
+      },
+    });
+
+    revalidatePath(`/order/${orderId}`);
+
+    return {
+      success: true,
+      message: 'Order marked as delivered',
+    };
+  } catch (error) {
     return {
       success: false,
       message: formatError(error),
