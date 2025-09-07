@@ -1,5 +1,7 @@
 'use server';
 
+import { PAGE_SIZE } from '@/lib/constants';
+import { revalidatePath } from 'next/cache';
 import { z } from 'zod';
 import {
   shippingAddressSchema,
@@ -154,6 +156,36 @@ export async function updateUserProfile(user: { name: string, email: string }) {
     });
     return { success: true, message: 'Successfully updated user' };
   } catch(error){
+    return { success: false, message: formatError(error) };
+  }
+}
+
+// get all users
+export async function getAllUsers({ limit = PAGE_SIZE, page }: { limit?: number, page: number }) {
+  const data = await prisma.user.findMany({
+    orderBy: { createdAt: 'desc' },
+    take: limit,
+    skip: (page - 1) * limit,
+  });
+
+  const dataCount = await prisma.user.count();
+
+  return {
+    data,
+    totalPages: Math.ceil(dataCount / limit),
+  };
+}
+
+export async function deleteUser(userId: string) {
+  try {
+    await prisma.user.delete({
+      where: { id: userId },
+    });
+
+    revalidatePath('/admin/users');
+
+    return { success: true, message: 'Successfully deleted user' };
+  } catch (error) {
     return { success: false, message: formatError(error) };
   }
 }
