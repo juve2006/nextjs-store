@@ -255,6 +255,7 @@ const ProductForm = ({ type, product, productId }: ProductFormProps) => {
                     </FormLabel>
                   </FormItem>
                 )}/>
+
               { isFeatured && banner && (
                 <Image
                   src={banner}

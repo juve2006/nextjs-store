@@ -2,7 +2,7 @@
 import { prisma } from '@/db/prisma';
 import { z } from 'zod';
 import { LATEST_PRODUCTS_LIMIT, PAGE_SIZE } from '@/lib/constants';
-import { formatError } from '@/lib/utils';
+import { convertToPlainObject, formatError } from '@/lib/utils';
 import { insertProductSchema, updateProductSchema } from '@/lib/validators';
 import { revalidatePath } from 'next/cache';
 
@@ -30,6 +30,17 @@ export async function getProductBySlug(slug: string) {
   })
 }
 
+// get single product by id
+export async function getProductById(productId: string) {
+  const data =  await prisma.product.findFirst({
+    where: {
+      id: productId,
+    }
+  });
+
+  return convertToPlainObject(data);
+}
+
 // get all products
 type GetAllProductsParams = {
   query: string;
@@ -38,8 +49,7 @@ type GetAllProductsParams = {
   category?: string;
 };
 
-
-export async function geyAllProducts({ query, limit = PAGE_SIZE, page, category }: GetAllProductsParams) {
+export async function geyAllProducts({ limit = PAGE_SIZE, page }: GetAllProductsParams) {
   const data = await prisma.product.findMany({
     orderBy: { createdAt: 'desc' },
     skip: (page - 1) * limit,
