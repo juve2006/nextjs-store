@@ -23,7 +23,7 @@ const AdminOrdersPage = async (props: {
     throw new Error('User is not admin')
   }
 
-  const orders = await getAllOrders({ page: Number(page), limit: 2 });
+  const orders = await getAllOrders({ page: Number(page), limit: 10 });
 
   return (
     <div className="space-y-2">
