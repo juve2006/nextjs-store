@@ -54,7 +54,7 @@ const UpdateUserForm = ({user}: { user: z.infer<typeof updateUserSchema> }) => {
           name="email"
           control={form.control}
           render={({field}: {
-            field: ControllerRenderProps<z.infer<typeof updateUserSchema>, 'name'>
+            field: ControllerRenderProps<z.infer<typeof updateUserSchema>, 'email'>
           }) => (
             <FormItem className="w-full">
               <FormLabel> Email </FormLabel>
