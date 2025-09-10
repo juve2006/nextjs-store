@@ -7,7 +7,7 @@ import {
   shippingAddressSchema,
   signInSchema,
   signUpSchema,
-  paymentMethodSchema,
+  paymentMethodSchema, updateUserSchema,
 } from '@/lib/validators';
 import { auth, signIn, signOut } from '@/auth';
 import { ShippingAddress } from '@/types';
@@ -187,5 +187,20 @@ export async function deleteUser(userId: string) {
     return { success: true, message: 'Successfully deleted user' };
   } catch (error) {
     return { success: false, message: formatError(error) };
+  }
+}
+
+export async function updateUser(user: z.infer<typeof updateUserSchema>) {
+  try {
+    await prisma.user.update({
+      where: {id: user.id},
+      data: {name: user.name, role: user.role},
+    });
+
+    revalidatePath(`/admin/users/`);
+
+    return {success: true, message: 'Successfully updated user'};
+  } catch (error) {
+    return {success: false, message: formatError(error)};
   }
 }
