@@ -13,9 +13,9 @@ export const metadata: Metadata = {
 };
 
 const AdminOrdersPage = async (props: {
-  searchParams: Promise<{ page: string }>
+  searchParams: Promise<{ page: string; query: string }>
 }) => {
-  const { page = '1' } = await props.searchParams;
+  const { page = '1', query:searchText } = await props.searchParams;
 
   const session = await auth();
 
@@ -23,11 +23,21 @@ const AdminOrdersPage = async (props: {
     throw new Error('User is not admin')
   }
 
-  const orders = await getAllOrders({ page: Number(page), limit: 10 });
+  const orders = await getAllOrders({ page: Number(page), limit: 10, query: searchText });
 
   return (
     <div className="space-y-2">
-      <h2 className="h2-bold"> Orders </h2>
+      <div className="flex items-center gap-3">
+        <h1 className="h2-bold">Orders</h1>
+        {searchText && (
+          <div>
+            Filtered by <i>&quot;{ searchText }&quot;</i>{' '}
+            <Link href='/admin/orders' className="ml-2">
+              <Button variant='outline' size='sm'>Remove Filter</Button>
+            </Link>
+          </div>
+        )}
+      </div>
       <div className="overflow-x-auto">
         <Table>
           <TableHeader>

@@ -15,10 +15,11 @@ export const metadata: Metadata = {
 
 const AdminUsersPage = async (props: {
   searchParams: Promise<{
-    page: string
+    page: string,
+    query: string
   }>
 }) => {
-  const { page = '1' } = await props.searchParams;
+  const { page = '1', query:searchText } = await props.searchParams;
 
   const session = await auth();
 
@@ -26,11 +27,21 @@ const AdminUsersPage = async (props: {
     throw new Error('User is not admin')
   }
 
-  const users = await getAllUsers({ page: Number(page) });
+  const users = await getAllUsers({ page: Number(page), limit: 10, query: searchText });
 
   return (
     <div className="space-y-2">
-      <h2 className="h2-bold"> Users </h2>
+      <div className="flex items-center gap-3">
+        <h1 className="h2-bold">Users</h1>
+        {searchText && (
+          <div>
+            Filtered by <i>&quot;{ searchText }&quot;</i>{' '}
+            <Link href='/admin/users' className="ml-2">
+              <Button variant='outline' size='sm'>Remove Filter</Button>
+            </Link>
+          </div>
+        )}
+      </div>
       <div className="overflow-x-auto">
         <Table>
           <TableHeader>
