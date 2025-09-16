@@ -1,5 +1,6 @@
 import Menu from './menu';
 import CategoryDrawer from './category-drawer';
+import Search from './search';
 import Image from 'next/image';
 import Link from 'next/link';
 import { APP_NAME } from '@/lib/constants';
@@ -22,6 +23,9 @@ const Header = () => {
               {APP_NAME}
             </span>
           </Link>
+        </div>
+        <div className="hidden md:block">
+          <Search />
         </div>
         <div className="space-x-2">
           <Menu/>
