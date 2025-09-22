@@ -5,7 +5,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import DeleteDialog from '@/components/shared/delete-dialog';
 import { Metadata } from 'next';
 import Link from 'next/link';
-import { geyAllProducts, deleteProduct } from '@/lib/actions/product.actions';
+import { getAllProducts, deleteProduct } from '@/lib/actions/product.actions';
 import { formatCurrency, formatId } from '@/lib/utils';
 
 export const metadata: Metadata = {
@@ -27,7 +27,7 @@ const AdminProductsPage = async (props: {
     throw new Error('User is not admin');
   }
 
-  const products = await geyAllProducts({ query: searchText, page, category });
+  const products = await getAllProducts({ query: searchText, page, category });
 
   return (
     <div className="space-y-2 mb-3">
