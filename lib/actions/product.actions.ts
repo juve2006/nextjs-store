@@ -47,9 +47,12 @@ type GetAllProductsParams = {
   limit?: number;
   page: number;
   category?: string;
+  price?: string;
+  rating?: string;
+  sort?: string;
 };
 
-export async function geyAllProducts({ limit = PAGE_SIZE, page }: GetAllProductsParams) {
+export async function geyAllProducts({ limit = PAGE_SIZE, page, query, category, price, rating, sort }: GetAllProductsParams) {
   const data = await prisma.product.findMany({
     orderBy: { createdAt: 'desc' },
     skip: (page - 1) * limit,

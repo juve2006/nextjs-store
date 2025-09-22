@@ -27,7 +27,7 @@ const Search = async () => {
           </SelectContent>
         </Select>
         <Input
-          name="categoryInput"
+          name="query"
           type="text"
           placeholder="Search..."
           className="md:w-[100px] lg:w-[300px]"
