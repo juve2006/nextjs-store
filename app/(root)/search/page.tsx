@@ -6,27 +6,29 @@ import Link from 'next/link';
 const prices = [
   {
     name: '1$ to 50$',
-    value: '1-50'
+    value: '1-50',
   },
   {
     name: '51$ to 100$',
-    value: '51-100'
+    value: '51-100',
   },
   {
     name: '101$ to 200$',
-    value: '101-200'
+    value: '101-200',
   },
   {
     name: '201$ to 500$',
-    value: '201-500'
+    value: '201-500',
   },
   {
     name: '501$ to 1000$',
-    value: '501-1000'
+    value: '501-1000',
   },
 ];
 
 const ratings = [4, 3, 2, 1];
+
+const sortOrders = ['newest', 'lowest', 'highest', 'rating'];
 
 const SearchPage = async (props: {
   searchParams: Promise<{
@@ -49,19 +51,19 @@ const SearchPage = async (props: {
 
   // construct filter url
   const getFilterUrl = ({
-                          c,
-                          s,
-                          p,
-                          r,
-                          pg
-                        }: {
+    c,
+    s,
+    p,
+    r,
+    pg,
+  }: {
     c?: string;
     s?: string;
     p?: string;
     r?: string;
     pg?: string;
   }) => {
-    const params = {query, category, price, rating, sort, page};
+    const params = { query, category, price, rating, sort, page };
     if (c) params.category = c;
     if (s) params.sort = s;
     if (p) params.price = p;
@@ -72,7 +74,7 @@ const SearchPage = async (props: {
   };
 
   const products = await getAllProducts({
-    query, category, price, rating, sort, page: Number(page)
+    query, category, price, rating, sort, page: Number(page),
   });
 
   const categories = await getAllCategories();
@@ -85,11 +87,13 @@ const SearchPage = async (props: {
         <div>
           <ul className="space-y-1">
             <li>
-              <Link className={`${(category === 'all' || category === '') && 'font-bold'}`} href={getFilterUrl({c: 'all'})}>Any</Link>
+              <Link className={`${(category === 'all' || category === '') && 'font-bold'}`}
+                    href={getFilterUrl({ c: 'all' })}>Any</Link>
             </li>
             {categories.map((x) => (
               <li key={x.category}>
-                <Link className={`${category === x.category && 'font-bold'}`} href={getFilterUrl({c: x.category})}>
+                <Link className={`${category === x.category && 'font-bold'}`}
+                      href={getFilterUrl({ c: x.category })}>
                   {x.category}
                 </Link>
               </li>
@@ -101,11 +105,13 @@ const SearchPage = async (props: {
         <div>
           <ul className="space-y-1">
             <li>
-              <Link className={`${price === 'all' && 'font-bold'}`} href={getFilterUrl({p: 'all'})}>Any</Link>
+              <Link className={`${price === 'all' && 'font-bold'}`}
+                    href={getFilterUrl({ p: 'all' })}>Any</Link>
             </li>
             {prices.map((x) => (
               <li key={x.value}>
-                <Link className={`${price === x.value && 'font-bold'}`} href={getFilterUrl({p: x.value})}>
+                <Link className={`${price === x.value && 'font-bold'}`}
+                      href={getFilterUrl({ p: x.value })}>
                   {x.name}
                 </Link>
               </li>
@@ -117,11 +123,13 @@ const SearchPage = async (props: {
         <div>
           <ul className="space-y-1">
             <li>
-              <Link className={`${rating === 'all' && 'font-bold'}`} href={getFilterUrl({r: 'all'})}>Any</Link>
+              <Link className={`${rating === 'all' && 'font-bold'}`}
+                    href={getFilterUrl({ r: 'all' })}>Any</Link>
             </li>
             {ratings.map((r) => (
               <li key={r}>
-                <Link className={`${rating ===r.toString() && 'font-bold'}`} href={getFilterUrl({r: `${r}`})}>
+                <Link className={`${rating === r.toString() && 'font-bold'}`}
+                      href={getFilterUrl({ r: `${r}` })}>
                   {`${r} stars & up`}
                 </Link>
               </li>
@@ -142,14 +150,18 @@ const SearchPage = async (props: {
               (category !== 'all' && category !== '') ||
               (price !== 'all') ||
               (rating !== 'all') ? (
-                <Button variant={'link'} asChild>
+                <Button variant={'link'}
+                        asChild>
                   <Link href={'/search'}>Clear Filters</Link>
                 </Button>
               ) : null
             }
           </div>
           <div>
-            {/* Sort */}
+            Sort by{' '}
+            {sortOrders.map((s) => (
+              <Link key={s} className={`mx-2 ${s == sort && 'font-bold'}`} href={getFilterUrl({ s })}> {s }</Link>
+            ))}
           </div>
         </div>
         <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
@@ -160,7 +172,7 @@ const SearchPage = async (props: {
         </div>
       </div>
     </div>
-  );
+);
 };
 
 export default SearchPage;
