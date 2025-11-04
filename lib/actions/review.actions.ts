@@ -47,29 +47,29 @@ export async function createUpdateReview(data: z.infer<typeof insertReviewSchema
       } else {
         await tx.review.create({ data: review });
       }
+
+      const averageRating = await tx.review.aggregate({
+        _avg: { rating: true },
+        where: { productId: review.productId },
+      });
+
+      const numReviews = await tx.review.count({
+        where: { productId: review.productId },
+      });
+
+      await tx.product.update({
+        where: { id: review.productId },
+        data: {
+          rating: averageRating._avg?.rating || 0,
+          numReviews,
+        },
+      });
     });
 
-    const averageRating = await tx.review.aggregate({
-      _avg: { rating: true },
-      where: { productId: review.productId },
-    });
-
-    const numReviews = await tx.review.count({
-      where: { productId: review.productId },
-    });
-
-    await tx.product.update({
-      where: { id: review.productId },
-      data: {
-        rating: averageRating._avg.rating || 0,
-        numReviews,
-      },
-    });
-
-    revalidatePath(`/productt/${product.slug}`);
+    revalidatePath(`/product/${product.slug}`);
 
     return {
-      success: false,
+      success: true,
       message: 'Review updated successfully',
     };
   } catch (error) {
@@ -78,4 +78,39 @@ export async function createUpdateReview(data: z.infer<typeof insertReviewSchema
       message: formatError(error),
     };
   }
+}
+
+// Get all reviews for a product
+export async function getReviews({ productId }: { productId: string }) {
+  const data = await prisma.review.findMany({
+    where: {
+      productId: productId,
+    },
+    include: {
+      user: {
+        select: {
+          name: true,
+        },
+      },
+    },
+    orderBy: {
+      createdAt: 'desc',
+    },
+  });
+
+  return { data };
+}
+
+// Get a review by current user
+export async function getReviewByProductId({ productId }: { productId: string }) {
+  const session = await auth();
+
+  if (!session) throw new Error('User is not authorized');
+
+  return await prisma.review.findFirst({
+    where: {
+      productId,
+      userId: session?.user?.id,
+    },
+  });
 }

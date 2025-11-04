@@ -19,13 +19,14 @@ import { insertReviewSchema } from '@/lib/validators';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { StarIcon } from 'lucide-react';
 import { useState } from 'react';
-import { useForm } from 'react-hook-form';
+import { SubmitHandler, useForm } from 'react-hook-form';
 import { z } from 'zod';
+import { createUpdateReview, getReviewByProductId } from '@/lib/actions/review.actions';
 
 const ReviewForm = ({ userId, productId, onReviewSubmitted }: {
   userId: string,
   productId: string,
-  onReviewSubmitted?: () => void
+  onReviewSubmitted: () => void
 }) => {
   const [open, setOpen] = useState(false);
 
@@ -36,8 +37,38 @@ const ReviewForm = ({ userId, productId, onReviewSubmitted }: {
     defaultValues: reviewFormDefaultValues,
   });
 
-  const handleOpenForm = () => {
+  const handleOpenForm = async () => {
+    form.setValue('productId', productId);
+    form.setValue('userId', userId);
+
+    const review = await getReviewByProductId(productId);
+
+    if(review) {
+      form.setValue('title', review.title);
+      form.setValue('description', review.description);
+      form.setValue('rating', review.rating);
+    }
+
     setOpen(true);
+  }
+
+  const onSubmit: SubmitHandler<z.infer<typeof insertReviewSchema>> = async (values) => {
+    const res = await createUpdateReview({ ...values, productId });
+
+    if (!res.success) {
+      return toast({
+        variant: 'destructive',
+        description: res.message,
+      });
+    }
+
+    setOpen(false);
+
+    onReviewSubmitted();
+
+    toast({
+      description: res.message
+    })
   }
 
   return (
@@ -45,7 +76,7 @@ const ReviewForm = ({ userId, productId, onReviewSubmitted }: {
       <Button onClick={handleOpenForm} variant="default">Write Review</Button>
       <DialogContent className="sm:max-w-[425px]">
         <Form {...form}>
-          <form method="post">
+          <form method="post" onSubmit={form.handleSubmit(onSubmit)}>
             <DialogHeader>
               <DialogTitle>Write Review</DialogTitle>
               <DialogDescription>

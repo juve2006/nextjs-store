@@ -1,3 +1,4 @@
+import Rating from '@/components/shared/product/rating';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent } from '@/components/ui/card';
 import { getProductBySlug } from '@/lib/actions/product.actions';
@@ -38,10 +39,10 @@ const ProductDetailsPage = async (props: {
               {product.brand} {product.category}
             </p>
             <h1 className="h3-bold">{product.name}</h1>
-            <p>{product.rating} of {product.numReviews} Reviews</p>
+            <Rating value={Number(product.rating)}/>
+            <p>{product.numReviews} reviews</p>
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-              <ProductPrice value={Number(product.price)}
-                            className="w-24 rounded-full bg-green-100 text-green-700 px-5 py-2"/>
+              <ProductPrice value={Number(product.price)} className="w-24 rounded-full bg-green-100 text-green-700 px-5 py-2"/>
             </div>
           </div>
           <div className="mt-10">
