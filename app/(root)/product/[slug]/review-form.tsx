@@ -41,7 +41,7 @@ const ReviewForm = ({ userId, productId, onReviewSubmitted }: {
     form.setValue('productId', productId);
     form.setValue('userId', userId);
 
-    const review = await getReviewByProductId(productId);
+    const review = await getReviewByProductId({ productId });
 
     if(review) {
       form.setValue('title', review.title);

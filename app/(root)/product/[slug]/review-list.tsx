@@ -15,7 +15,7 @@ const ReviewList = ({ userId, productId, productSlug }: { userId: string, produc
 
   useEffect(() => {
       const loadReviews = async () => {
-        const res = await getReviews(productId);
+        const res = await getReviews({ productId });
         setReviews(res.data);
       };
 
@@ -23,7 +23,7 @@ const ReviewList = ({ userId, productId, productSlug }: { userId: string, produc
   }, [productId]);
 
   const reload = async () => {
-    const res = await getReviews(productId);
+    const res = await getReviews({ productId });
     setReviews([...res.data]);
   };
 
