@@ -12,15 +12,17 @@ import { useToast } from '@/hooks/use-toast';
 import { useTransition } from 'react';
 import { PayPalButtons, PayPalScriptProvider, usePayPalScriptReducer } from '@paypal/react-paypal-js';
 import { createPaypalOrder, approvePaypalOrder, updateOrderToPaidCOD, deliverOrder } from '@/lib/actions/order.actions';
+import StripePayment from './stripe-payment';
 
 type OrderDetailsTableProps = {
   order: Order;
   paypalClientId: string;
   isAdmin: boolean;
+  stripeClientSecret?: string;
 }
 
 
-const OrderDetailsTable = ({ order, paypalClientId, isAdmin }: OrderDetailsTableProps) => {
+const OrderDetailsTable = ({ order, paypalClientId, isAdmin, stripeClientSecret }: OrderDetailsTableProps) => {
   const {
     id,
     shippingAddress,
@@ -215,6 +217,15 @@ const OrderDetailsTable = ({ order, paypalClientId, isAdmin }: OrderDetailsTable
                                    onApprove={handleApprovePaypalOrder}/>
                   </PayPalScriptProvider>
                 </div>
+              )}
+
+              {/* Stripe Payment */}
+              {!isPaid && paymentMethod === 'Stripe' && stripeClientSecret && (
+                <StripePayment
+                  priceInCents={Math.round(Number(order.totalPrice * 100))}
+                  orderId={order.id}
+                  clientSecret={stripeClientSecret}
+                />
               )}
 
               {/* Cash on Delivery */}
