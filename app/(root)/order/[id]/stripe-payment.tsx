@@ -37,7 +37,7 @@ const StripePayment = ({ priceInCents, orderId, clientSecret }: StripePaymentPro
       stripe.confirmPayment({
         elements,
         confirmParams: {
-          return_url: `${SERVER_URL}/order/${orderId}/stripe-success`,
+          return_url: `${SERVER_URL}/order/${orderId}/stripe-payment-success`,
         },
       }).then(({ error }) => {
         if (error?.type === 'card_error' || error?.type === 'validation_error') {
