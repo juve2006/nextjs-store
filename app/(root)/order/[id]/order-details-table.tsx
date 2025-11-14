@@ -222,7 +222,7 @@ const OrderDetailsTable = ({ order, paypalClientId, isAdmin, stripeClientSecret 
               {/* Stripe Payment */}
               {!isPaid && paymentMethod === 'Stripe' && stripeClientSecret && (
                 <StripePayment
-                  priceInCents={Math.round(Number(order.totalPrice * 100))}
+                  priceInCents={Math.round(Number(order.totalPrice) * 100)}
                   orderId={order.id}
                   clientSecret={stripeClientSecret}
                 />
