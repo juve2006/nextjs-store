@@ -2,11 +2,12 @@
 
 import { auth } from '@/auth';
 import { prisma } from '@/db/prisma';
+import { sendPurchaseReceipt } from '@/email';
 import { getMyCart } from '@/lib/actions/cart.actions';
 import { getUserById } from '@/lib/actions/user.actions';
 import { convertToPlainObject, formatError } from '@/lib/utils';
 import { insertOrderSchema } from '@/lib/validators';
-import { CartItem, PaymentResult } from '@/types';
+import { CartItem, PaymentResult, ShippingAddress } from '@/types';
 import { Prisma } from '@prisma/client';
 import { isRedirectError } from 'next/dist/client/components/redirect-error';
 import { paypal } from '@/lib/paypal';
@@ -251,6 +252,14 @@ export async function updateOrderToPaid({ orderId, paymentResult }: { orderId: s
     },
   });
   if (!updatedOrder) throw new Error('Order not found');
+
+  await sendPurchaseReceipt({
+    order: {
+      ...updatedOrder,
+      shippingAddress: updatedOrder.shippingAddress as ShippingAddress,
+      paymentResult: updatedOrder.paymentResult as PaymentResult
+    }
+  })
 }
 
 // get users orders

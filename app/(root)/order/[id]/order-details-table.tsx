@@ -15,7 +15,7 @@ import { createPaypalOrder, approvePaypalOrder, updateOrderToPaidCOD, deliverOrd
 import StripePayment from './stripe-payment';
 
 type OrderDetailsTableProps = {
-  order: Order;
+  order: Omit<Order, 'paymentResult'>
   paypalClientId: string;
   isAdmin: boolean;
   stripeClientSecret: string | null;
