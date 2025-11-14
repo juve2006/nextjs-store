@@ -18,7 +18,7 @@ type OrderDetailsTableProps = {
   order: Order;
   paypalClientId: string;
   isAdmin: boolean;
-  stripeClientSecret?: string;
+  stripeClientSecret: string | null;
 }
 
 
