@@ -1,7 +1,7 @@
 import { Button } from '@/components/ui/button';
 import { SERVER_URL } from '@/lib/constants';
 import { formatCurrency } from '@/lib/utils';
-import { useState } from 'react';
+import { FormEvent, useState } from 'react';
 import { loadStripe } from '@stripe/stripe-js';
 import { Elements, useStripe, useElements, PaymentElement, LinkAuthenticationElement } from '@stripe/react-stripe-js';
 import { useTheme } from 'next-themes';
