@@ -22,7 +22,7 @@ const OrderDetailsPage = async (props: {
 
   const session = await auth();
 
-  let clientSecret: string | undefined = null;
+  let clientSecret: string | undefined = undefined;
 
   // Check if is not paid and payment method is stripe
   if (!order.isPaid && order.paymentMethod === 'Stripe') {
