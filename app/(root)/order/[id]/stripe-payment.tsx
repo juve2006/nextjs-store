@@ -69,7 +69,7 @@ const StripePayment = ({ priceInCents, orderId, clientSecret }: StripePaymentPro
     <Elements
       options={{
         clientSecret,
-        appearance: { theme: theme === 'dark' ? 'night' : 'theme' === 'light' ? 'stripe' : systemTheme === 'light' ? 'stripe' : 'night' },
+        appearance: { theme: theme === 'dark' ? 'night' : theme === 'light' ? 'stripe' : systemTheme === 'light' ? 'stripe' : 'night' },
       }}
       stripe={stripePromise}>
       <StripeForm />
