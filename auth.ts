@@ -79,16 +79,6 @@ export const config = {
         token.id = user.id;
         token.role = user.role;
 
-        //if user has no name then use email
-        if (user.name === 'NO_NAME') {
-          token.name = user.email?.split('@')[0];
-          //update db to reflect the token name
-          await prisma.user.update({
-            where: { id: user.id },
-            data: { name: token.name },
-          });
-        }
-
         if (trigger === 'signIn' || trigger === 'signOut') {
           const cookiesObj = await cookies();
           const sessionCartId = cookiesObj.get('sessionCartId')?.value;
