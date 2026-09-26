@@ -12,7 +12,7 @@ export const authConfig = {
         /\/place-order/,
         /\/profile/,
         /\/user\/(.*)/,
-        /\/ordrer\/(.*)/,
+        /\/order\/(.*)/,
         /\/admin/,
       ];
 

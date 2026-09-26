@@ -16,6 +16,7 @@ import { hashSync } from 'bcrypt-ts-edge';
 import { prisma } from '@/db/prisma';
 import { formatError } from '@/lib/utils';
 import { Prisma } from '@prisma/client';
+import { requireAdmin } from '@/lib/auth-guards';
 
 export async function signInWithCredentials(prevState: unknown, formData: FormData) {
   try {
@@ -163,6 +164,7 @@ export async function updateUserProfile(user: { name: string, email: string }) {
 
 // get all users
 export async function getAllUsers({ limit = PAGE_SIZE, page, query }: { limit?: number, page: number, query: string }) {
+  await requireAdmin();
   const queryFilter: Prisma.UserWhereInput = query && query !== 'all' ? {
     name: {
       contains: query,
@@ -188,6 +190,7 @@ export async function getAllUsers({ limit = PAGE_SIZE, page, query }: { limit?: 
 }
 
 export async function deleteUser(userId: string) {
+  await requireAdmin();
   try {
     await prisma.user.delete({
       where: { id: userId },
@@ -202,6 +205,7 @@ export async function deleteUser(userId: string) {
 }
 
 export async function updateUser(user: z.infer<typeof updateUserSchema>) {
+  await requireAdmin();
   try {
     await prisma.user.update({
       where: {id: user.id},

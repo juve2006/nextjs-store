@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import Stripe from 'stripe';
-import { updateOrderToPaid } from '@/lib/actions/order.actions';
+import { updateOrderToPaid } from '@/lib/orders';
 
 export async function POST(req: NextRequest) {
   // Build the webhook event

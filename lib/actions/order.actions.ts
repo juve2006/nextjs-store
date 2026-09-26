@@ -2,18 +2,19 @@
 
 import { auth } from '@/auth';
 import { prisma } from '@/db/prisma';
-import { sendPurchaseReceipt } from '@/email';
 import { getMyCart } from '@/lib/actions/cart.actions';
 import { getUserById } from '@/lib/actions/user.actions';
 import { convertToPlainObject, formatError } from '@/lib/utils';
 import { insertOrderSchema } from '@/lib/validators';
-import { CartItem, PaymentResult, ShippingAddress } from '@/types';
+import { CartItem, PaymentResult } from '@/types';
+import { updateOrderToPaid } from '@/lib/orders';
 import { Prisma } from '@prisma/client';
 import { isRedirectError } from 'next/dist/client/components/redirect-error';
 import { paypal } from '@/lib/paypal';
 import { revalidatePath } from 'next/cache';
 import { z } from 'zod';
 import { PAGE_SIZE } from '@/lib/constants';
+import { requireAdmin } from '@/lib/auth-guards';
 
 
 // Create order and order items
@@ -116,6 +117,7 @@ export async function getOrderById(orderId: string) {
       return null;
   }
 
+  const session = await auth();
   const data = await prisma.order.findFirst({
     where: {
       id: orderId,
@@ -126,14 +128,15 @@ export async function getOrderById(orderId: string) {
     },
   });
 
+  // Only the owner or an admin may see an order
+  if (!data || (data.userId !== session?.user?.id && session?.user?.role !== 'admin')) return null;
+
   return convertToPlainObject(data);
 }
 
 export async function createPaypalOrder(orderId: string) {
   try {
-    const order = await prisma.order.findFirst({
-      where: { id: orderId },
-    });
+    const order = await getOrderById(orderId);
 
     if (order) {
       //create PayPal order
@@ -169,9 +172,7 @@ export async function createPaypalOrder(orderId: string) {
 export async function approvePaypalOrder(orderId: string,
   data: { orderID: string }) {
   try {
-    const order = await prisma.order.findFirst({
-      where: { id: orderId },
-    });
+    const order = await getOrderById(orderId);
 
     if (!order) throw new Error('Order not Found');
 
@@ -202,65 +203,6 @@ export async function approvePaypalOrder(orderId: string,
   }
 }
 
-//update order to pay
-export async function updateOrderToPaid({ orderId, paymentResult }: { orderId: string, paymentResult?: PaymentResult }) {
-  const order = await prisma.order.findFirst({
-    where: { id: orderId },
-    include: { orderitems: true },
-  });
-
-  if (!order) throw new Error('Order not Found');
-  if (order.isPaid) throw new Error('Order is already paid');
-
-  // Transaction to update order and account for product stock
-  await prisma.$transaction(async (tx) => {
-    // iterate over products and update stock
-    for (const item of order.orderitems) {
-      await tx.product.update({
-        where: { id: item.productId },
-        data: {
-          stock: {
-            increment: -item.qty,
-          },
-        },
-      });
-    }
-    // set order to pay
-    await tx.order.update({
-      where: { id: orderId },
-      data: {
-        isPaid: true,
-        paidAt: new Date(),
-        paymentResult: paymentResult,
-      },
-    });
-  });
-
-  // get updated order after transaction
-  const updatedOrder = await prisma.order.findFirst({
-    where: {
-      id: orderId,
-    },
-    include: {
-      orderitems: true,
-      user: {
-        select: {
-          name: true,
-          email: true,
-        },
-      },
-    },
-  });
-  if (!updatedOrder) throw new Error('Order not found');
-
-  await sendPurchaseReceipt({
-    order: {
-      ...updatedOrder,
-      shippingAddress: updatedOrder.shippingAddress as ShippingAddress,
-      paymentResult: updatedOrder.paymentResult as PaymentResult
-    }
-  })
-}
 
 // get users orders
 export async function getMyOrders({ limit = PAGE_SIZE, page }: { limit?: number, page: number }) {
@@ -291,6 +233,7 @@ type SalesDataType = {
 
 // get sales data and order summary
 export async function getOrderSummary() {
+  await requireAdmin();
   // get counts for each resource
   const ordersCount = await prisma.order.count();
   const productsCount = await prisma.product.count();
@@ -338,6 +281,7 @@ export async function getOrderSummary() {
 
 // get all orders
 export async function getAllOrders({ limit = PAGE_SIZE, page, query }: { limit?: number, page: number, query: string }) {
+  await requireAdmin();
   const queryFilter: Prisma.OrderWhereInput = query && query !== 'all' ? {
     user: {
       name: {
@@ -367,6 +311,7 @@ export async function getAllOrders({ limit = PAGE_SIZE, page, query }: { limit?:
 
 // delete order
 export async function deleteOrder(orderId: string) {
+  await requireAdmin();
   try {
     await prisma.order.delete({
       where: {
@@ -391,6 +336,7 @@ export async function deleteOrder(orderId: string) {
 
 // update COD order to pay
 export async function updateOrderToPaidCOD(orderId: string) {
+  await requireAdmin();
   try {
     await updateOrderToPaid({ orderId });
 
@@ -410,6 +356,7 @@ export async function updateOrderToPaidCOD(orderId: string) {
 
 // update COD order to delivered
 export async function deliverOrder(orderId: string) {
+  await requireAdmin();
   try {
     const order = await prisma.order.findFirst({
       where: {
