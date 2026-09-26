@@ -8,6 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - `npm run dev` — dev server (Turbopack) on :3000
 - `npm run lint` / `npm run build`
+- `npm run start` locally needs `AUTH_TRUST_HOST=true`, or every auth route fails with `UntrustedHost`. Auth.js trusts the host automatically only on Vercel and under `next dev`.
+- Agents run the app and tests against `.env.testing` (gitignored, created from `.env`), never `.env`: use `npm run dev:testing` / `npm run start:testing`. `npm test` loads `.env.testing` through `jest.setup.ts`. Node's `--env-file` sets these values first, and Next does not override variables that are already set.
 - `npm test` — Jest via ts-jest. Single test: `npx jest tests/paypal.test.ts -t "creates a paypal order"`
 - `npm run email` — react-email preview server for `email/` on :3001
 - `npx prisma migrate dev --name <name>` after editing `prisma/schema.prisma`; `prisma generate` runs on `postinstall`
