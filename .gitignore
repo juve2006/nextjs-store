@@ -41,3 +41,13 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 /.idea/
+/.claude
+/.codex
+/.idea
+.ai/workspace
+.ai/runtime
+.ai/config.local.yaml
+*.log
+.claude/worktrees/
+!/CLAUDE.md
+!/AGENTS.md
