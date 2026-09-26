@@ -1,0 +1,11 @@
+# Timer for jig-housekeeping.service. See systemd.service for installation.
+
+[Unit]
+Description=Run jig housekeeping daily
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,19 @@
+# Linux per-user unit for jig housekeeping.
+#
+# Copy this and systemd.timer to ~/.config/systemd/user/, replace
+# /path/to/project, then:
+#
+#     systemctl --user daemon-reload
+#     systemctl --user enable --now jig-housekeeping.timer
+#
+# SuccessExitStatus includes 3: "a task needs consolidating" is information,
+# not a unit failure.
+
+[Unit]
+Description=Jig housekeeping
+
+[Service]
+Type=oneshot
+WorkingDirectory=/path/to/project
+ExecStart=/path/to/project/.ai/scripts/jig housekeeping
+SuccessExitStatus=0 3

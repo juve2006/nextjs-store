@@ -1,0 +1,7 @@
+# Profile manifest. Flat YAML subset, same reader as .ai/config.yaml.
+name: node
+description: Node.js projects (pnpm/yarn/bun/npm, chosen by packageManager or lock file; test, lint, typecheck scripts).
+detect: [package.json]
+scope: [changed, map, explain]
+carry: [node_modules]
+lock: [package-lock.json, yarn.lock, pnpm-lock.yaml, bun.lockb]

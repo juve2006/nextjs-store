@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS per-user agent for jig housekeeping.
+
+  Copy to ~/Library/LaunchAgents/dev.jig.housekeeping.plist, replace
+  /path/to/project, then:
+
+      launchctl load ~/Library/LaunchAgents/dev.jig.housekeeping.plist
+
+  StartInterval is seconds; 86400 is once a day. RunAtLoad makes the first run
+  happen at login rather than 24 hours later.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.jig.housekeeping</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/path/to/project/.ai/scripts/jig</string>
+    <string>housekeeping</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/path/to/project</string>
+  <key>StartInterval</key>
+  <integer>86400</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/path/to/project/.ai/runtime/housekeeping.log</string>
+  <key>StandardErrorPath</key>
+  <string>/path/to/project/.ai/runtime/housekeeping.log</string>
+</dict>
+</plist>

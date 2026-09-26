@@ -1,0 +1,2 @@
+.ai/scripts/** text eol=lf
+.ai/profiles/**/*.sh text eol=lf

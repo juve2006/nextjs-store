@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# jig — deterministic mechanics for the Jig agent SDLC framework.
+#
+# Dispatcher: resolves its own location, loads shared libraries and sources
+# scripts/lib/<command>.sh which must define cmd_<command>.
+# Scripts never invoke an LLM (ADR-0001). bash 3.2 compatible (ADR-0002).
+set -eu
+set -o pipefail
+
+# Resolve symlinks without readlink -f (absent on older macOS).
+jig_resolve_path() {
+  local p="$1" dir
+  while [ -L "$p" ]; do
+    dir=$(cd "$(dirname "$p")" && pwd)
+    p=$(readlink "$p")
+    case "$p" in /*) ;; *) p="$dir/$p" ;; esac
+  done
+  dir=$(cd "$(dirname "$p")" && pwd)
+  printf '%s/%s\n' "$dir" "$(basename "$p")"
+}
+
+JIG_SELF=$(jig_resolve_path "${BASH_SOURCE[0]}")
+JIG_LIB=$(cd "$(dirname "$JIG_SELF")/lib" && pwd)
+export JIG_SELF JIG_LIB
+
+# shellcheck source=lib/version.sh
+. "$JIG_LIB/version.sh"
+# shellcheck source=lib/common.sh
+. "$JIG_LIB/common.sh"
+
+# Before anything reads a repository: the process decides which checkout it is
+# in from where it was started, not from what it was told. jig_require_repo
+# clears these too, but it runs inside cmd_<command>, and the checkout recorder
+# sourced below resolves the root before any command does — the one component
+# whose whole job is to describe its own surroundings would otherwise have been
+# the last to stop taking them on hearsay.
+jig_clear_git_location_env
+
+# shellcheck source=lib/config.sh
+. "$JIG_LIB/config.sh"
+# shellcheck source=lib/checkout.sh
+. "$JIG_LIB/checkout.sh"
+
+jig_usage() {
+  cat <<EOF
+jig $JIG_VERSION — deterministic mechanics for agent-driven SDLC
+
+Usage: jig <command> [args]
+
+  init [--from <dir>] [--link] [--session-hook]
+                                 bootstrap .ai/ in the current repository
+  upgrade [--from <dir>]         update framework-owned files (manifest-aware)
+  status [--html | --open]       active tasks, housekeeping flags, drift;
+                                 --html writes the status page to .ai/runtime/status.html,
+                                 --open writes it and opens it in the browser; once it
+                                 exists, task, spec and housekeeping commands keep it current
+  task new|start|set|abandon ... task workspace and state (new files it, start begins it)
+  task changes <id> --base <ref> inventory all change layers; --files and --format paths
+  task artifacts <id> [...]      fixed-route inputs; --provided names conversation outputs
+  task finding add|set <id> ...  record a review finding and update its status
+  task findings <id> [--blocking]  list findings; --blocking exits 1 while any block completion
+  task ship <id> --message-file <f> [...]
+                                 commit/push/open a pull request, up to agent.git's level
+  task receipt <id> --stage review|architecture-review
+                                 pin what was reviewed; --check reports drift, exit 1 if stale
+  task autopilot <id> start|stage|repair|stop|resume|end|report
+                                 run a task's route without stopping between stages;
+                                 repair caps out at 2 and stops the run (exit 3)
+  task gate <id> approved        record the human's approval of a T3/T4 design
+  context [...]                  relevant knowledge for a task
+  context resolve [...]          required documents; --stage, --no-task, --catalog
+  context pending|guard [...]    knowledge required but not yet acknowledged
+  context acknowledge [...]      record documents as read
+  verify                         run active profiles' checks (or preview with --explain)
+  knowledge check                validate .ai/knowledge
+  knowledge new <type> <slug>    create a knowledge document (jig knowledge for types)
+  knowledge paths [...]          report or maintain documents' paths coverage
+  knowledge summary <id> <text>  set the one-line catalog summary
+  knowledge stages add|remove <id> <stage>  maintain additive stage relevance
+  knowledge proposed             list documents awaiting accept or reject
+  knowledge accept <id>...       promote proposed document(s) to active
+  knowledge reject <id>...       mark proposed document(s) as rejected
+  knowledge inventory [...]      deterministic facts about the repository's shape
+  knowledge changed --base <ref>  knowledge documents created/modified since <ref>
+  knowledge stale [--strict]     documents that drifted away from the code
+  knowledge reviewed <id>        stamp a document as reconciled with the code
+  spec new <id>                  create .ai/specs/<id>/ from the specification templates
+  spec list                      specifications under .ai/specs/ and their roadmap progress
+  spec done <task-id>            check the roadmap items that name a spec-linked task
+  spec close <id> [--leftovers-handled]
+                                 remove a spec whose roadmap is done (no epic)
+  spec epic <id> [--finish [--leftovers-handled] | --reopen]
+                                 cut, finish or reopen a spec's epic branch
+  spec remove <id> [--dry-run] [--abandon-unstarted]
+                                 unlink a spec's open tasks and move the spec to trash
+  housekeeping [--dry-run] [--verbose]  reconcile workspaces with remote state
+  config set <key> <value> [...] --local [--dry-run]
+                                 write your own settings to .ai/config.local.yaml;
+                                 local keys only, values checked, never .ai/config.yaml
+  config unset <key> [...] --local [--dry-run]
+                                 remove keys from .ai/config.local.yaml, including
+                                 ones no reader answers from
+  config show --local            print .ai/config.local.yaml and the keys in it
+                                 that no reader answers from
+  config keys                    every key jig reads, its default, which file
+                                 answers for it, and what .ai/config.yaml omits
+  measure                        knowledge quality, process weight, change size
+  doctor                         check the local environment jig runs in
+  self-update                    move the global framework checkout to the newest release
+  version                        print version
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"
+  [ $# -gt 0 ] && shift
+  case "$cmd" in
+    help|-h|--help) jig_usage ;;
+    version|--version) printf 'jig %s\n' "$JIG_VERSION" ;;
+    init|upgrade|status|task|context|verify|knowledge|spec|housekeeping|measure|doctor|config)
+      if [ ! -f "$JIG_LIB/$cmd.sh" ]; then
+        jig_die "command '$cmd' is not available in jig $JIG_VERSION"
+      fi
+      # Say that a session is working here, before the command runs: HEAD must
+      # be read before `task start` moves it. `help` and `version` are not work
+      # and leave nothing behind
+      # (adr-20260924-a-checkout-records-what-is-happening-in-it).
+      jig_checkout_record "$cmd" "$@"
+      # And tell this session when HEAD moved under it since it last looked.
+      # Only the commands a session orients itself with print it; which those
+      # are is checkout.sh's to know, not the dispatcher's.
+      jig_checkout_notice "$cmd" "$@"
+      # shellcheck disable=SC1090
+      . "$JIG_LIB/$cmd.sh"
+      "cmd_$cmd" "$@"
+      ;;
+    # A hyphen is not a portable function-name character, so this command's
+    # function is named explicitly rather than derived from the command.
+    self-update)
+      if [ ! -f "$JIG_LIB/self-update.sh" ]; then
+        jig_die "command '$cmd' is not available in jig $JIG_VERSION"
+      fi
+      # shellcheck source=lib/self-update.sh
+      . "$JIG_LIB/self-update.sh"
+      cmd_self_update "$@"
+      ;;
+    *)
+      jig_usage >&2
+      jig_die "unknown command: $cmd"
+      ;;
+  esac
+}
+
+main "$@"

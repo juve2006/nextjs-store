@@ -1,0 +1,11 @@
+# Profile manifest. Flat YAML subset, same reader as .ai/config.yaml.
+name: generic
+scope: [explain]
+description: Baseline profile, always active.
+detect: always
+# What this profile claims about the code: nothing. It has no checks of its own
+# — the git-repository test it runs is a guard, which may fail a run and may not
+# pass one. A project this profile is alone in is told that nothing verifies it,
+# and is not refused over it
+# (adr-20260925-one-test-run-per-clone-and-a-dead-run-is-not-a-pass).
+verifies: nothing

@@ -1,0 +1,8 @@
+# Run jig housekeeping every day at 09:15.
+# Install with: crontab -e
+#
+# Housekeeping is quiet and touches the network at most once per run. Exit code
+# 3 means "a task needs consolidating"; cron will mail it like any other
+# non-zero exit, which is usually what you want.
+
+15 9 * * * cd /path/to/project && .ai/scripts/jig housekeeping >> .ai/runtime/housekeeping.log 2>&1

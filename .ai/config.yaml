@@ -1,0 +1,54 @@
+# Jig project configuration.
+# Flat YAML subset: `section.key: value`, inline lists only, no nesting.
+# Paths are NOT configurable: .ai/knowledge, .ai/workspace, .ai/runtime are fixed.
+# Any key that is absent takes the default built into the scripts.
+#
+# Settings that are yours alone go in .ai/config.local.yaml: same format,
+# gitignored, one file per clone. It wins over this file for the keys it is
+# allowed to answer (the housekeeping.* ones, checkout.busy_ttl and
+# git.worktree_root), and `jig status` shows what it changes. Four more are
+# read from there and never from this file at all, because a value committed
+# here would decide for every contributor what their own agent may do on their
+# behalf: agent.git (how far the agent takes a finished task), agent.ci_timeout,
+# autopilot.unattended and autopilot.parallel.
+#
+# `jig config keys` lists every key this version reads, its default, and which
+# of the two files answers for it. Run it after an upgrade: nothing edits this
+# file but you (ADR-0024), so a key added by a newer Jig is one this file will
+# go on saying nothing about, and `jig doctor` names those.
+
+profiles: [generic, node]
+adapters: [claude, codex]
+
+git.base_branch: main                 # merge target for ancestry checks
+git.branch_per_task: true             # `jig task start` creates and checks out a branch
+git.branch_template: task/{id}        # {id} is the task id; validated by git itself
+# git.worktree_root: ../<project>.worktrees   # where `jig task start --worktree` puts worktrees
+# worktree.carry: [.env.testing]        # extra paths copied into a new worktree, beyond profiles
+#   never a directory holding its own git repository: the worktree gets a second clone, and
+#   `git worktree remove` by hand deletes it silently — see https://jig.fapost.in/working-with-tasks
+forge: auto                           # auto | github | gitlab | none
+
+housekeeping.cadence: 1d              # session hook runs housekeeping if last run is older
+housekeeping.fetch: true              # allow `git fetch` during housekeeping
+housekeeping.trash_ttl: 7d            # trash entries older than this are deleted
+housekeeping.abandoned_ttl: 14d       # abandoned workspaces are purged after this
+housekeeping.stale_after: 60d         # older active tasks are reported as STALE_CANDIDATE
+
+# checkout.busy_ttl: 12h              # how long a record of work in this checkout still counts
+#   as a live session; every jig run refreshes its own, and an older one is ignored, never deleted
+
+knowledge.require_frontmatter: true   # `jig knowledge check` fails on missing frontmatter
+
+# verify.full_run: local | ci. Set `ci` only when CI runs every check on each
+# pull request: `jig verify` then checks what changed since git.base_branch
+# and leaves the full set to CI. It still runs everything when CI is set or
+# with --full.
+# verify.full_run: local
+
+# verify.busy_ttl: how long a running `jig verify` holds this clone. A second
+# run — here or in any worktree of it — waits for the first instead of
+# competing with it for the machine. Past this age the record is ignored, so
+# raise it if your suite takes longer than this. `0` never waits; in CI the
+# mechanism is off, because parallel jobs there are the point.
+# verify.busy_ttl: 30m

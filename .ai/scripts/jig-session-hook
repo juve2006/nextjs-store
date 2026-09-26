@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# jig-session-hook — the cheap housekeeping trigger (domains/housekeeping).
+#
+# Runs at the start of an agent session. When nothing is due the whole cost is
+# one `stat`: no network, no git, no forge. When housekeeping *is* due it is
+# started detached and the hook returns immediately, because a session must
+# never wait on it.
+#
+# This script exits 0 in every circumstance, including "not a jig project",
+# "not initialised" and "housekeeping failed". A hook that can fail is a hook
+# that can break the session it is attached to, and a background cleanup job
+# is never worth that.
+#
+# Installed as .ai/scripts/jig-session-hook. The runtime's own config file
+# refers to it by path; the framework never edits that file (ADR-0024).
+#
+# Deliberate exception to convention-shell's "every executable starts with
+# `set -eu` and `set -o pipefail`": `set -e` would abort this script at the
+# first failing probe, skipping the final `exit 0` and handing the runtime a
+# non-zero status from a background cleanup job. Every giving-up path here
+# returns explicitly instead, so `set -u` alone is the whole safety net.
+set -u
+
+main() {
+  local self dir project cadence stamp age_days cadence_days
+
+  # Resolve our own location without readlink -f (absent on older macOS), so
+  # the hook works from a symlinked install too.
+  self="${BASH_SOURCE[0]}"
+  while [ -L "$self" ]; do
+    dir=$(cd "$(dirname "$self")" && pwd) || return 0
+    self=$(readlink "$self")
+    case "$self" in /*) ;; *) self="$dir/$self" ;; esac
+  done
+  dir=$(cd "$(dirname "$self")" && pwd) || return 0
+
+  # .ai/scripts/jig-session-hook -> the project root is two levels up.
+  project=$(cd "$dir/../.." && pwd) || return 0
+  [ -f "$project/.ai/config.yaml" ] || return 0
+  # -f, not -x, and `bash` below: a project committed from Windows records
+  # .ai/scripts/jig without the executable bit, and the hook then skipped
+  # housekeeping for every teammate on macOS and Linux, silently.
+  [ -f "$project/.ai/scripts/jig" ] || return 0
+
+  stamp="$project/.ai/runtime/last-housekeeping"
+  # The dispatcher's own reader, so a cadence set in .ai/config.local.yaml
+  # counts here as it does in housekeeping (ADR-0038). It reads files only:
+  # no git on the idle path.
+  [ -f "$dir/lib/config.sh" ] || return 0
+  # Read by config.sh; deliberately not exported, so the detached jig below
+  # resolves its own project.
+  # shellcheck disable=SC2034
+  JIG_PROJECT="$project"
+  # shellcheck disable=SC2034
+  JIG_AI_DIR=".ai"
+  # shellcheck source=lib/config.sh
+  . "$dir/lib/config.sh" || return 0
+  cadence=$(cfg housekeeping.cadence 1d)
+
+  cadence_days=${cadence%d}
+  case "$cadence_days" in
+    '' | *[!0-9]*) cadence_days=1 ;;
+  esac
+
+  if [ -f "$stamp" ]; then
+    age_days=$(_age_days "$stamp")
+    [ "$age_days" -ge "$cadence_days" ] || return 0
+  fi
+
+  # Detached, output to the log, stdin closed: nothing here can block or
+  # print into the session's transcript.
+  mkdir -p "$project/.ai/runtime" 2>/dev/null || return 0
+  (
+    cd "$project" || exit 0
+    bash "$project/.ai/scripts/jig" housekeeping \
+      >> "$project/.ai/runtime/housekeeping.log" 2>&1 </dev/null
+  ) &
+  return 0
+}
+
+_age_days() {
+  local f="$1" mtime now
+  if mtime=$(stat -f %m "$f" 2>/dev/null); then :; else
+    mtime=$(stat -c %Y "$f" 2>/dev/null) || { printf '0\n'; return; }
+  fi
+  now=$(date +%s)
+  printf '%d\n' $(( (now - mtime) / 86400 ))
+}
+
+main "$@"
+exit 0
