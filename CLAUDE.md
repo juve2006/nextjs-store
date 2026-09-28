@@ -15,7 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `npx prisma migrate dev --name <name>` after editing `prisma/schema.prisma`; `prisma generate` runs on `postinstall`
 - `npx tsx ./db/seed` — seed from `db/sample-data.ts`
 
-Env vars: copy `.example-env` to `.env`. `jest.setup.ts` loads `.env`, and `tests/paypal.test.ts` calls the real PayPal sandbox, so tests need valid `PAYPAL_*` credentials.
+Env vars: copy `.example-env` to `.env`. `jest.setup.ts` loads `.env.testing`, and `tests/paypal.test.ts` calls the real PayPal sandbox, so `.env.testing` needs valid `PAYPAL_*` credentials.
 
 ## Architecture
 

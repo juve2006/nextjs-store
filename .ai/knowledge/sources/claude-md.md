@@ -6,7 +6,8 @@ domains: []
 paths: []
 source: CLAUDE.md
 summary: "CLAUDE.md: npm commands and an architecture summary written for Claude Code; Codex does not load it"
-source_hash: 751488786fd3a5ebfdc93069ad0bb75a4e90aef3
+source_hash: 95f3d92b987d6796fceb03c838f53274112a1e2e
+reviewed_at: 2026-09-28
 ---
 # CLAUDE.md — commands and architecture notes for Claude Code
 
