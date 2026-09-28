@@ -1,8 +1,8 @@
 # jig manifest. Do not edit by hand; maintained by `jig init` and `jig upgrade`.
-jig.version: 0.16.0
+jig.version: 0.16.1
 jig.source: /Users/juve/.local/share/jig
 jig.mode: copy
-installed_at: 2026-09-26
+installed_at: 2026-09-28
 adapters: [claude, codex]
 instructions.section: 58c8bd8b56bb713c34867b45c66326f25d531ea2 AGENTS.md
 ---
@@ -15,7 +15,7 @@ deb99d56d9fbd4ef35d537b9e184a6e8c7888513 .ai/scripts/jig
 3ec0200881ca93c4d9a2e2c1ca1b333abe8988f3 .ai/scripts/jig.cmd
 2b497d608b7c0b266ad3e2c94d9b47b7ed8f0467 .ai/scripts/lib/bootstrap.sh
 1e3ef6af5fe0b1afced0b39e97d8c29ab434ee29 .ai/scripts/lib/checkout.sh
-91de8135a04eded8fa29e8b6c70bc9068a18b5e6 .ai/scripts/lib/common.sh
+e613777ed50cc7179ade4d605d8f23048b314b30 .ai/scripts/lib/common.sh
 e4337cf535368430091d798470991dc6da640943 .ai/scripts/lib/config.sh
 d36cebe5657e4f59575f7c5b91ea99fa4e9744c9 .ai/scripts/lib/context.sh
 6dfa1a9c790e49df49e3974da4fd32c444a6c711 .ai/scripts/lib/doctor.sh
@@ -25,16 +25,16 @@ d36cebe5657e4f59575f7c5b91ea99fa4e9744c9 .ai/scripts/lib/context.sh
 61033217186cb33ff82fc0a783053d0f3e757586 .ai/scripts/lib/knowledge.sh
 cc959231c876d2612a5ca919e54e1c96bb4b7277 .ai/scripts/lib/manifest.sh
 2a4117e106e33843856571b9a2841ecbf2b3250e .ai/scripts/lib/measure.sh
-29096e7a9d839be078bc7c5609baf1d59dee4d3b .ai/scripts/lib/profile.sh
+64399c2102272cfb46a26ffbff166ec272e5a844 .ai/scripts/lib/profile.sh
 fa836707b8566849bf0820bee45f631cc3d831da .ai/scripts/lib/profiles.sh
 7b75a4056c595e14ccbfc4a108fe3e06617ead87 .ai/scripts/lib/section.sh
 3b755989d045b8350efbcd400c178d335b6e67f0 .ai/scripts/lib/self-update.sh
 1a04945833f4e71c000cef97cb627efadaaf4adc .ai/scripts/lib/spec.sh
 d01f27820e449d1174143c5ef7c1e2a6d8a510dc .ai/scripts/lib/status.sh
 1dd08a1bfea28ec13856342f649cc2d70df0d8ff .ai/scripts/lib/task.sh
-20177eb0db3f9a172450c5ec7965459f55c6b467 .ai/scripts/lib/upgrade.sh
+43640e8daa22539061437e77810b322ef40af691 .ai/scripts/lib/upgrade.sh
 12c6f66417c3d7e40c0eaef0b61a16705c49694a .ai/scripts/lib/verify.sh
-58d28fc075939fcf7d6bb5a90fb965bada11632b .ai/scripts/lib/version.sh
+6623d91c506f70a86d436348f227b575ec4d911d .ai/scripts/lib/version.sh
 25bf569d5e95309869aa5cb0e3c963b45b92e1f4 .ai/templates/AGENTS.md
 0bfa7525891285b0ade4424461b542041a8580b3 .ai/templates/knowledge/ARCHITECTURE.md
 4d242f6e411f31ac0d087f53ecd3f1fa135c8425 .ai/templates/knowledge/GLOSSARY.md

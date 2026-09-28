@@ -48,17 +48,22 @@ jp_plan() {
   printf 'PLAN %s: %s: %s (%s)\n' "$JP_PROFILE" "$check" "$state" "$reason"
 }
 
-# jp_plan_selection <check> <selection> <label> — a common shape for checks
-# whose narrowed filters come from jp_decide. Callers handle missing filters
-# and tool-specific uncertainty before using this helper.
+# jp_plan_selection <check> <selection> <label> [reason] — a common shape for
+# checks whose narrowed filters come from jp_decide. Callers handle missing
+# filters and tool-specific uncertainty before using this helper.
+#
+# [reason] is why the full set runs, for the ALL case only, and a profile
+# builds it from the path jp_decide_cause names. Optional on purpose: a
+# profile that passes nothing keeps the wording it had, so this argument
+# cannot change an installed user profile's plan.
 jp_plan_selection() {
-  local check="$1" selection="$2" label="$3" listed
+  local check="$1" selection="$2" label="$3" reason="${4:-}" listed
   if ! jp_scoped; then
     jp_plan "$check" full "full scope"
   elif [ -z "$selection" ]; then
     jp_plan "$check" skip "no changed file maps to this check"
   elif [ "$selection" = ALL ]; then
-    jp_plan "$check" full "changed paths require the full set"
+    jp_plan "$check" full "${reason:-changed paths require the full set}"
   else
     listed=$(printf '%s\n' "$selection" | paste -sd, -)
     jp_plan "$check" filtered "$label: $listed"
@@ -177,6 +182,53 @@ jp_decide() {
   else
     printf '%s\n' "$out" | sed '/^$/d' | LC_ALL=C sort -u
   fi
+  return 0
+}
+
+# _jp_cause_raw <builtin-fn> — the changed paths <builtin-fn> answers ALL for,
+# in the order they were read. A function of its own for the same bash 3.2
+# reason as _jp_decide_raw.
+_jp_cause_raw() {
+  local fn="$1" f decision IFS=$' \t\n'
+  if [ -n "${JIG_VERIFY_MAPPED:-}" ] && [ -f "${JIG_VERIFY_MAPPED:-}" ]; then
+    while IFS="$(printf '\t')" read -r f decision; do
+      [ -n "$f" ] || continue
+      case "$decision" in
+        '?')
+          # An `if`, not `a && b`: under set -e a non-matching path as the
+          # loop body's last command would end the loop and truncate the answer.
+          if jp_has_line ALL "$("$fn" "$f")"; then printf '%s\n' "$f"; fi
+          ;;
+      esac
+    done < "$JIG_VERIFY_MAPPED"
+  else
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      if jp_has_line ALL "$("$fn" "$f")"; then printf '%s\n' "$f"; fi
+    done < "$JIG_VERIFY_FILES"
+  fi
+  return 0
+}
+
+# jp_decide_cause <builtin-fn> — the first changed path whose own rule makes
+# jp_decide answer ALL, so a profile can say which file widened the run
+# instead of only that something did. "changed paths require the full set"
+# named nothing, and a person reading it could not tell their package.json
+# from their orphan class.
+#
+# Empty when nothing forces ALL, and empty as well when the project's own
+# .ai/verify/<profile>.map is what said ALL: that line is one its author
+# wrote, and attributing it to a rule of the profile's would be a wrong
+# explanation rather than a missing one.
+jp_decide_cause() {
+  local out
+  jp_scoped || return 0
+  # Not `| head -1`: the writer is a bash function, and a reader that stops
+  # before the end of its input leaves it with SIGPIPE, which pipefail reads
+  # as a failure (conventions/shell.md). Take the first line from the string.
+  out=$(_jp_cause_raw "$1" | sed '/^$/d')
+  [ -n "$out" ] || return 0
+  printf '%s\n' "${out%%$'\n'*}"
   return 0
 }
 

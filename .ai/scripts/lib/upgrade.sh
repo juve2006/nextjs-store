@@ -161,6 +161,56 @@ _upgrade_config_note() {
   _upgrade_out 'hint: `jig config keys` lists them; that file is yours to change or leave as it is'
 }
 
+# _upgrade_self_check <dry-run> — after a real run, ask the install that now
+# exists whether anything is still not installed, and name it.
+#
+# The predicate is not a new one: it is `upgrade_pending`, the same question
+# `jig doctor` and `jig status` ask. What this adds is the moment. Until now an
+# unfinished run said nothing, and the leftover surfaced whenever somebody
+# happened to run another command — the reported case was a run that printed
+# "55 placed, 49 kept, 2 removed; manifest updated" and left
+# `.ai/templates/AGENTS.md` unplaced, found a day later in `jig doctor` as
+# "1 pending item(s) although the version is the same".
+#
+# It runs the project's own dispatcher as a subprocess, and that is the point,
+# not an implementation detail: an upgrade is carried out by the code of the
+# version being replaced. The run that left that template behind was 0.15.1
+# doing the work, and 0.15.1 does not stage `.ai/templates/AGENTS.md` at all —
+# the line that copies it arrived in 0.16.0. Worse, the template was in the
+# manifest and not in its stage, so the old code deleted it. Asking
+# `upgrade_pending` in this process would ask the old decision table, which is
+# satisfied by construction: it would stay silent in exactly the case this
+# check exists for. Only the newly installed code knows what it wants.
+#
+# Never on a dry run — `status`, `verify` and `doctor` each run one on every
+# invocation (ADR-0017), and a self-check there would double their cost and
+# recurse. A real upgrade pays one extra dry run (0.78 s against 0.88 s for the
+# run itself, on 97 files), for a command that runs once per release.
+#
+# It never fails the upgrade it follows: that upgrade already happened, and a
+# check that cannot answer says so instead of turning a success into an error
+# (ADR-0017's "unknown is not zero"). `bash "$jig"`, not `"$jig"`, for the
+# reason jig_status_page_touch uses it: Windows has no execute bit.
+_upgrade_self_check() {
+  [ "$1" != 1 ] || return 0
+  local jig="$JIG_PROJECT/$JIG_AI_DIR/scripts/jig" out rc=0 n
+  [ -f "$jig" ] || return 0
+  out=$( (cd "$JIG_PROJECT" && bash "$jig" upgrade --dry-run) </dev/null 2>&1 ) || rc=$?
+  if [ "$rc" != 0 ]; then
+    _upgrade_out "could not confirm this install is complete; run \`jig doctor\`"
+    return 0
+  fi
+  out=$(printf '%s\n' "$out" | grep -E '^(install|link|replace) ' || true)
+  [ -n "$out" ] || return 0
+  n=$(printf '%s\n' "$out" | grep -c . || true)
+  _upgrade_out "$n item(s) still not installed; run \`jig upgrade\` again"
+  # Indented, the way every other note under a report line is: these are
+  # another run's words quoted back, and unindented they would be
+  # indistinguishable from this run's own `install`/`replace` lines — to a
+  # reader, and to anything that reads the report by its line starts.
+  _upgrade_out "$(printf '%s\n' "$out" | sed 's/^/  /')"
+}
+
 # --- decision table (domains/install) ---------------------------------------------
 
 # _upgrade_place <staged-abs> <local-abs> — copy one staged file into the
@@ -189,7 +239,8 @@ _upgrade_place() {
 # path and appends the resulting manifest line ("<hash> <path>") to the
 # caller's `new_entries` variable (dynamic scope; cmd_upgrade declares it
 # local, along with the placed_count/kept_count/removed_count/conflict_count
-# tally this function keeps for the run summary). Prints one report line per
+# tally this function keeps for the run summary, and reconciled_count, which
+# decides whether the manifest is rewritten at all). Prints one report line per
 # non-trivial action.
 #
 # The three hashes come precomputed from _upgrade_hash_table, empty when the
@@ -205,7 +256,22 @@ _upgrade_process_path() {
   local_abs="$JIG_PROJECT/$rel"
   if [ -n "$local_hash" ]; then local_exists=1; else local_exists=0; fi
 
-  if [ "$staged_exists" = 1 ] && [ "$in_manifest" = 1 ]; then
+  # The third comparison, and the first question asked: is the file already
+  # exactly what this run would install? Then it is placed, whoever placed it,
+  # and the only thing left to do is to say so in the manifest.
+  #
+  # Without it an interrupted run can never be repeated. Files are placed one
+  # at a time and the manifest is written once at the end, so an interruption
+  # leaves new bytes on disk against an old recorded hash — which the branches
+  # below read as "the user edited this file" (`keep-modified`, or
+  # `keep-conflict` for a path the manifest does not know yet) and never
+  # reconsider. The content is the one predicate that cannot be lost, go stale
+  # or arrive from somebody else's clone, so the repeat needs no journal
+  # (adr-20260926-an-interrupted-upgrade-is-repeated-not-rolled-back).
+  if [ "$staged_exists" = 1 ] && [ "$local_exists" = 1 ] \
+     && [ "$local_hash" = "$staged_hash" ]; then
+    action=already-placed
+  elif [ "$staged_exists" = 1 ] && [ "$in_manifest" = 1 ]; then
     if [ "$local_exists" = 0 ]; then
       action=install # tracked but missing locally: reinstall
     elif [ "$local_hash" = "$manifest_hash" ]; then
@@ -230,16 +296,30 @@ _upgrade_process_path() {
   fi
 
   case "$action" in
-    replace)
-      if [ "$staged_hash" != "$local_hash" ]; then
-        if [ "$dry_run" != 1 ]; then
-          _upgrade_place "$staged_abs" "$local_abs"
-        fi
-        _upgrade_out "replace $rel"
-        placed_count=$((placed_count + 1))
-      else
-        kept_count=$((kept_count + 1))
+    already-placed)
+      # Reported only when the manifest did not already say so, which is
+      # exactly when this run reconciled something: the ordinary case where
+      # manifest, disk and stage all agree is the quiet majority of every run
+      # and stays silent. Counted in `kept`, like every other outcome that
+      # writes no file, and deliberately not one of upgrade_pending's verbs —
+      # the file is current. `reconciled_count` is counted separately because
+      # it decides whether the manifest is rewritten at all, below.
+      if [ "$manifest_hash" != "$staged_hash" ]; then
+        _upgrade_out "already-placed $rel"
+        reconciled_count=$((reconciled_count + 1))
       fi
+      kept_count=$((kept_count + 1))
+      new_entries="$new_entries
+$staged_hash $rel"
+      ;;
+    replace)
+      # A file that already carries the staged bytes is `already-placed` above,
+      # so reaching here means the two differ and the file is written.
+      if [ "$dry_run" != 1 ]; then
+        _upgrade_place "$staged_abs" "$local_abs"
+      fi
+      _upgrade_out "replace $rel"
+      placed_count=$((placed_count + 1))
       new_entries="$new_entries
 $staged_hash $rel"
       ;;
@@ -320,7 +400,8 @@ _UPGRADE_SECTION_TMP=""
 # | no     | malformed |                     | keep-malformed |
 # | yes    | ok        | = record, = source  | (silent)       |
 # | yes    | ok        | = record, ≠ source  | replace        |
-# | yes    | ok        | ≠ record            | keep-modified  |
+# | yes    | ok        | ≠ record, = source  | already-placed |
+# | yes    | ok        | ≠ record, ≠ source  | keep-modified  |
 # | yes    | none      | the section removed | keep-modified  |
 # | yes    | malformed |                     | keep-malformed |
 _upgrade_section() {
@@ -379,15 +460,30 @@ _upgrade_section() {
   fi
 
   cur_hash=$(jig_section_hash "$file")
+  new_hash=$(jig_section_hash "$template")
+
+  # The file table's third comparison, applied to the region: the section has
+  # the same hole, because its record lives in the manifest header and the
+  # header is written at the end of the run. Replace the section, die before
+  # the manifest, and the region is the source's text against an older
+  # recorded hash — read below as an edit, and so never replaced again.
+  #
+  # ADR-20260924's invariants are untouched. Reaching here means a record
+  # exists, so a human already consented to jig owning this region; the text
+  # is not changed by a byte, only the hash the manifest remembers of it.
+  if [ "$cur_hash" = "$new_hash" ]; then
+    if [ "$cur_hash" != "$rec_hash" ]; then
+      _UPGRADE_SECTION_ACTION=already-placed
+      _UPGRADE_SECTION_RECORD="$new_hash AGENTS.md"
+      _upgrade_out "already-placed AGENTS.md (Jig section)"
+    fi
+    return 0 # already current, and silent like every other unchanged path
+  fi
+
   if [ "$cur_hash" != "$rec_hash" ]; then
     _UPGRADE_SECTION_ACTION=keep-modified
     _upgrade_out "keep-modified AGENTS.md (Jig section)"
     return 0
-  fi
-
-  new_hash=$(jig_section_hash "$template")
-  if [ "$new_hash" = "$cur_hash" ]; then
-    return 0 # already current, and silent like every other unchanged path
   fi
 
   if [ "$dry_run" != 1 ]; then
@@ -502,7 +598,7 @@ _upgrade_link() {
   # never reads the list back — _upgrade_link_one already reports each
   # conflict immediately, one line per path, as it happens.
   # shellcheck disable=SC2034
-  local created_count=0 kept_count=0 conflict_count=0 conflict_paths=""
+  local created_count=0 kept_count=0 conflict_count=0 conflict_paths="" reconciled_count=0
   local p a skill_dir sname sdir pdir adir dest_pdir
 
   _upgrade_link_one "$(cd "$source/scripts" && pwd)" "$JIG_PROJECT/.ai/scripts" "$dry_run"
@@ -542,6 +638,7 @@ _upgrade_link() {
   _upgrade_section "$source" "$dry_run"
   case "$_UPGRADE_SECTION_ACTION" in
     replace) created_count=$((created_count + 1)) ;;
+    already-placed) kept_count=$((kept_count + 1)); reconciled_count=$((reconciled_count + 1)) ;;
     keep-modified | keep-malformed | keep-unmarked) kept_count=$((kept_count + 1)) ;;
     keep-conflict) conflict_count=$((conflict_count + 1)) ;;
   esac
@@ -555,13 +652,36 @@ _upgrade_link() {
   # no manifest body to keep either. So an upgrade whose every path was a
   # conflict leaves the file exactly as it was, source and version included
   # (adr-20260922-upgrade-records-the-source-it-installed-from).
+  #
+  # The one thing in between after all: the marked section's record lives in
+  # the header, which link mode does write, so a run whose only work was
+  # reconciling that record has something to save. Dropped, the section stays
+  # unreplaceable for ever — the state this change ends
+  # (adr-20260926-an-interrupted-upgrade-is-repeated-not-rolled-back).
+  #
+  # But it does not earn <source> the header. Where copy mode may name the
+  # checkout it reconciled from — every reconciled path holds that checkout's
+  # bytes — a link-mode run that created no link leaves the project running the
+  # scripts it ran before, and naming another checkout would send the next plain
+  # `jig upgrade` to read from it (adr-20260922). So the record is kept and the
+  # source is not moved: the two decisions are separate here.
+  local record_source=""
   if _upgrade_records_source "$source" "$created_count"; then
+    record_source="$source"
+  elif [ "$reconciled_count" != 0 ]; then
+    record_source=$(manifest_source)
+  fi
+
+  if [ -n "$record_source" ]; then
     local version adapters_manifest
-    version=$(_upgrade_source_version "$source")
+    version=$(_upgrade_source_version "$record_source")
     adapters_manifest=$(_upgrade_csv "$active_adapters")
-    manifest_write_entries "$version" "$source" "$adapters_manifest" "link" \
+    manifest_write_entries "$version" "$record_source" "$adapters_manifest" "link" \
       "$_UPGRADE_SECTION_RECORD" < /dev/null
     _upgrade_summary "$created_count" "$kept_count" 0 "$conflict_count" "updated"
+    if [ "$record_source" != "$source" ]; then
+      _upgrade_kept_source_note "$source" "link"
+    fi
   else
     _upgrade_summary "$created_count" "$kept_count" 0 "$conflict_count" "unchanged"
     _upgrade_kept_source_note "$source" "link"
@@ -647,6 +767,7 @@ cmd_upgrade() {
     [ "$_JIG_LINK_KIND" = symlink ] \
       || jig_die "upgrade: this project is installed in link mode, which needs symbolic links, and they cannot be made here"
     _upgrade_link "$source" "$active_profiles" "$active_adapters" "$dry_run"
+    _upgrade_self_check "$dry_run"
     _upgrade_config_note "$dry_run"
     return 0
   fi
@@ -662,7 +783,7 @@ cmd_upgrade() {
     > "$_UPGRADE_WORK/table"
 
   local new_entries="" rel mhash lhash shash t
-  local placed_count=0 kept_count=0 removed_count=0 conflict_count=0
+  local placed_count=0 kept_count=0 removed_count=0 conflict_count=0 reconciled_count=0
   t=$(printf '\t')
   while IFS="$t" read -r rel mhash lhash shash; do
     [ -n "$rel" ] || continue
@@ -681,6 +802,7 @@ cmd_upgrade() {
   _upgrade_section "$source" "$dry_run"
   case "$_UPGRADE_SECTION_ACTION" in
     replace) placed_count=$((placed_count + 1)) ;;
+    already-placed) kept_count=$((kept_count + 1)); reconciled_count=$((reconciled_count + 1)) ;;
     keep-modified | keep-malformed | keep-unmarked) kept_count=$((kept_count + 1)) ;;
     keep-conflict) conflict_count=$((conflict_count + 1)) ;;
   esac
@@ -697,7 +819,18 @@ cmd_upgrade() {
   # install, replace or delete, every entry it would write is the one the
   # manifest already holds (keep-modified and keep-outside carry the recorded
   # hash forward verbatim).
-  if _upgrade_records_source "$source" "$((placed_count + removed_count))"; then
+  #
+  # A reconciliation counts as applied, and it has to. It is the one outcome
+  # that changes the body while writing no file: the entry it carries forward
+  # is the staged hash, not the recorded one. Left out of this count, a repeat
+  # of a run interrupted after its last placement would find every path already
+  # placed, write nothing, and report "manifest unchanged" — the state this
+  # whole change exists to end, reached by the fix itself. Naming <source> in
+  # the header is right in that case too: every reconciled path holds that
+  # checkout's bytes, so the project is an install of it, and the interrupted
+  # run only failed to say so.
+  if _upgrade_records_source "$source" \
+       "$((placed_count + removed_count + reconciled_count))"; then
     local version adapters_manifest
     version=$(_upgrade_source_version "$source")
     adapters_manifest=$(_upgrade_csv "$active_adapters")
@@ -709,6 +842,7 @@ cmd_upgrade() {
     _upgrade_summary "$placed_count" "$kept_count" "$removed_count" "$conflict_count" "unchanged"
     _upgrade_kept_source_note "$source" "copy"
   fi
+  _upgrade_self_check "$dry_run"
   _upgrade_config_note "$dry_run"
 }
 

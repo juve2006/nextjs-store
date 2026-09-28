@@ -1383,9 +1383,53 @@ jig_status_page_flush() {
   jig_status_page_touch --refresh
 }
 
+# jig_hash_git_dir — the git directory every hash in this project is computed
+# against, empty when the project is not in a repository at all. Asked of git
+# once per shell that asks, because it costs a git startup and `jig status`
+# hashes on every invocation; a caller inside `$(...)` is a subshell and pays
+# again, which is why the batching rule below matters more than this cache.
+#
+# `git hash-object` reads two things from wherever it happens to run, and both
+# of them decide whether two hashes of identical bytes come out equal:
+#
+#   - the object format. In a repository created with --object-format=sha256 a
+#     file hashes to 64 hex digits; outside any repository, to 40. `jig
+#     upgrade` hashes the project inside it and its staging tree in $TMPDIR
+#     outside it, so in a SHA-256 project every framework file compared
+#     unequal: the first run replaced all 97 of them and wrote SHA-1 hashes
+#     into a SHA-256 manifest, and from the second run on every file read as
+#     `keep-modified` and `jig status` reported drift that was never there.
+#   - the clean filters. A `filter=` driver or a `text` attribute makes the
+#     hash of a path in a repository the hash of its *cleaned* content, which
+#     the same bytes outside a repository do not have.
+#
+# --no-filters answers the second and not the first, so both are needed: one
+# hash space for the project, and the bytes on disk as they are.
+#
+# Sets _JIG_HASH_GIT_DIR rather than printing it (jig_link_detect's pattern):
+# a `$(...)` result would be computed in a subshell, where the answer could not
+# be kept. An empty GIT_DIR is not "unset" to git but a fatal "the empty string
+# is not a valid path", so every caller branches on it instead of exporting it.
+jig_hash_git_dir() {
+  [ -z "${_JIG_HASH_GIT_DIR_SET:-}" ] || return 0
+  _JIG_HASH_GIT_DIR=$(git -C "${JIG_PROJECT:-.}" rev-parse --absolute-git-dir 2>/dev/null) \
+    || _JIG_HASH_GIT_DIR=""
+  _JIG_HASH_GIT_DIR_SET=1
+}
+
 # Content hash used by the manifest (ADR-0003, domains/install). git is mandatory,
-# shasum/sha256sum are not portable.
-jig_hash() { git hash-object "$1"; }
+# shasum/sha256sum are not portable. Hashed in the project's own hash space and
+# without filters, the same way jig_hash_list does it: the two must never
+# disagree about the hash of one file, or one writer of the manifest would
+# record what the other reads as a modification.
+jig_hash() {
+  jig_hash_git_dir
+  if [ -n "$_JIG_HASH_GIT_DIR" ]; then
+    GIT_DIR="$_JIG_HASH_GIT_DIR" git hash-object --no-filters "$1"
+  else
+    git hash-object --no-filters "$1"
+  fi
+}
 
 # jig_copy_tree <src-dir> <dst-dir> — copy every regular file under <src-dir>
 # (`find -type f`: symlinks and empty directories are not copied) to the same
@@ -1442,9 +1486,18 @@ jig_copy_tree() {
 # where one call took 0.013 s — it was most of what `jig status` cost.
 # Pair the output back with its paths by position (`paste`); a path containing
 # a newline would desync that, and none of jig's line-based lists can hold one.
+#
+# <base> is often outside the project — `jig upgrade` hashes its staging tree in
+# $TMPDIR — and the hash must come out the same as for the same bytes inside it,
+# so the project's git directory travels with the call (jig_hash_git_dir).
 jig_hash_list() {
   [ -s "$2" ] || return 0
-  (cd "$1" && git hash-object --stdin-paths) < "$2"
+  jig_hash_git_dir
+  if [ -n "$_JIG_HASH_GIT_DIR" ]; then
+    (cd "$1" && GIT_DIR="$_JIG_HASH_GIT_DIR" git hash-object --no-filters --stdin-paths) < "$2"
+  else
+    (cd "$1" && git hash-object --no-filters --stdin-paths) < "$2"
+  fi
 }
 
 # Path of <file> relative to <base>, both absolute. Pure string operation.
