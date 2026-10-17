@@ -33,12 +33,22 @@
 #   (*.test.*/*.spec.*), run directly. Any other changed source file, or no
 #   runner found, sends test to the full script.
 # - typecheck never narrows: a per-file check cannot see the errors a
-#   changed file introduces in code that calls it, unnarrowed like mypy.
+#   changed file introduces in code that calls it. In a narrowed run it
+#   runs the whole project, or under `verify.full_run: ci` is left to CI.
 # - package.json, any lock file, tsconfig*, and the eslint/vite/vitest/jest
 #   configs affect the whole project and send lint and test to their full
-#   set.
+#   set. Under `verify.full_run: ci` a lint that would run the full script is
+#   left to CI as well (`skip (scope: ..., full set left to CI)`).
 # Where a check bypasses the project's own script to call a runner
 # directly, the note names that runner (`scope: vitest related, 3 files`).
+#
+# node is the degenerate case among the stacks that narrow a front end away:
+# its own js/ts source *is* the code under test, so nothing there is cut.
+# What still needs the same care is a stylesheet or an image/font asset —
+# neither jest nor vitest imports or executes one as code — narrowed to
+# nothing unless it sits under a served or built directory (public/, dist/,
+# build/) or beside the test suite's own fixtures, where it can still be
+# read as data (ADR-0013).
 set -eu
 set -o pipefail
 
@@ -51,6 +61,22 @@ jp_begin node
 NODE_ALL_GLOBS="package.json package-lock.json pnpm-lock.yaml yarn.lock bun.lock bun.lockb tsconfig.json tsconfig.*.json .eslintrc .eslintrc.* eslint.config.* vite.config.* vitest.config.* jest.config.*"
 
 NODE_TEST_EXTS="js jsx ts tsx mjs cjs mts cts"
+
+# The two kinds of path excluded from _node_is_asset_ext below and left to
+# map to ALL, because for them an asset change can change a test's result:
+# public/, dist/ and build/ hold what gets served or is already built, and a
+# file under a fixtures/mocks directory may be read by a test as data.
+NODE_ASSET_NOT_GLOBS="public/* dist/* build/* */__fixtures__/* */__mocks__/* test/fixtures/* tests/fixtures/*"
+
+# _node_is_asset_ext <path> — a stylesheet or image/font extension: never
+# imported as executable code by jest or vitest, so a change to one cannot
+# change what a test run observes.
+_node_is_asset_ext() {
+  case "$1" in
+    *.css | *.scss | *.sass | *.less | *.styl | *.svg | *.png | *.jpg | *.jpeg | *.gif | *.webp | *.ico | *.woff | *.woff2 | *.ttf | *.eot) return 0 ;;
+  esac
+  return 1
+}
 
 # _node_has_script <name> — true when package.json declares a "<name>"
 # script. Grep-based on purpose: SPEC requires no mandatory dependency
@@ -179,7 +205,7 @@ _node_all_glob_changed() {
 
 MGR=$(_node_pm)
 MGR_BIN=""
-if command -v "$MGR" >/dev/null 2>&1; then
+if jp_have "$MGR"; then
   MGR_BIN="$MGR"
 fi
 
@@ -226,6 +252,9 @@ _node_builtin_jest() {
   case "$f" in
     *.md | *.mdx | docs/* | .ai/*) return 0 ;;
   esac
+  if _node_is_asset_ext "$f" && ! jp_path_matches "$f" "$NODE_ASSET_NOT_GLOBS"; then
+    return 0
+  fi
   if ! _node_is_source_ext "$f"; then
     printf 'ALL\n'
     return 0
@@ -249,6 +278,9 @@ _node_builtin_vitest() {
   case "$f" in
     *.md | *.mdx | docs/* | .ai/*) return 0 ;;
   esac
+  if _node_is_asset_ext "$f" && ! jp_path_matches "$f" "$NODE_ASSET_NOT_GLOBS"; then
+    return 0
+  fi
   if ! _node_is_source_ext "$f"; then
     printf 'ALL\n'
     return 0
@@ -277,17 +309,40 @@ _node_builtin_all_glob() {
   return 1
 }
 
+# _node_all_reason <path> — why the full set runs, for the path
+# jp_decide_cause named. "not narrowable" was one shrug for several
+# different situations, and the person reading it could not tell their
+# package.json from a source no test is named after. An empty <path> means
+# the project's own map asked for the full set; that line's author knows
+# why, so the old wording stands rather than a guess at their reason.
+_node_all_reason() {
+  local f="$1"
+  if [ -z "$f" ]; then
+    printf 'not narrowable\n'
+  elif _node_builtin_all_glob "$f"; then
+    printf '%s can affect any test\n' "$f"
+  elif _node_is_source_ext "$f"; then
+    printf 'no related tests found for %s\n' "$f"
+  else
+    printf 'the profile cannot map %s to tests\n' "$f"
+  fi
+  return 0
+}
+
 # _node_test_via_jest <jest-bin> <manager-version-note>
 _node_test_via_jest() {
-  local jest="$1" mv="$2" v filters n listing missing
+  local jest="$1" mv="$2" v filters n listing missing why
   v=$(jp_version "$jest" --version)
-  filters=$(jp_decide _node_builtin_jest)
+  jp_select _node_builtin_jest
+  filters=$JP_SELECTION
   if [ -z "$filters" ]; then
     jp_skip "$TEST_LABEL" "scope: no changed file maps to a test"
     return 0
   fi
   if [ "$filters" = ALL ]; then
-    _node_full_test "$mv, scope: not narrowable, ran full set"
+    why=$(_node_all_reason "$(jp_decide_cause _node_builtin_jest)")
+    jp_full_left_to_ci "$TEST_LABEL" "$why" \
+      || _node_full_test "$mv, scope: $why, ran full set"
     return 0
   fi
   IFS='
@@ -298,7 +353,8 @@ _node_test_via_jest() {
   set +f
   IFS=$' \t\n'
   if missing=$(jp_first_missing "$@"); then
-    _node_full_test "$mv, scope: filter '$missing' selects no tests, ran full set"
+    jp_full_left_to_ci "$TEST_LABEL" "filter '$missing' selects no tests" \
+      || _node_full_test "$mv, scope: filter '$missing' selects no tests, ran full set"
     return 0
   fi
   # --listTests only lists and exits; it never runs a test, so this is safe
@@ -306,23 +362,27 @@ _node_test_via_jest() {
   listing=$("$jest" --listTests --findRelatedTests "$@" 2>/dev/null) || listing=""
   n=$(printf '%s\n' "$listing" | grep -c . || true)
   if [ "$n" -eq 0 ]; then
-    _node_full_test "$mv, scope: jest finds no related tests, ran full set"
+    jp_full_left_to_ci "$TEST_LABEL" "jest finds no related tests" \
+      || _node_full_test "$mv, scope: jest finds no related tests, ran full set"
   else
-    jp_run "$TEST_LABEL" "$v, scope: jest related, $n files" "$jest" --findRelatedTests "$@"
+    jp_run "$TEST_LABEL" "$v, scope: jest related, $n files$JP_SELECTION_NOTE" "$jest" --findRelatedTests "$@"
   fi
 }
 
 # _node_test_via_vitest <vitest-bin> <manager-version-note>
 _node_test_via_vitest() {
-  local vitest="$1" mv="$2" v filters missing
+  local vitest="$1" mv="$2" v filters missing why
   v=$(jp_version "$vitest" --version)
-  filters=$(jp_decide _node_builtin_vitest)
+  jp_select _node_builtin_vitest
+  filters=$JP_SELECTION
   if [ -z "$filters" ]; then
     jp_skip "$TEST_LABEL" "scope: no changed file maps to a test"
     return 0
   fi
   if [ "$filters" = ALL ]; then
-    _node_full_test "$mv, scope: not narrowable, ran full set"
+    why=$(_node_all_reason "$(jp_decide_cause _node_builtin_vitest)")
+    jp_full_left_to_ci "$TEST_LABEL" "$why" \
+      || _node_full_test "$mv, scope: $why, ran full set"
     return 0
   fi
   IFS='
@@ -333,10 +393,11 @@ _node_test_via_vitest() {
   set +f
   IFS=$' \t\n'
   if missing=$(jp_first_missing "$@"); then
-    _node_full_test "$mv, scope: filter '$missing' selects no tests, ran full set"
+    jp_full_left_to_ci "$TEST_LABEL" "filter '$missing' selects no tests" \
+      || _node_full_test "$mv, scope: filter '$missing' selects no tests, ran full set"
     return 0
   fi
-  jp_run "$TEST_LABEL" "$v, scope: vitest related, $# files" "$vitest" run "$@"
+  jp_run "$TEST_LABEL" "$v, scope: vitest related, $# files$JP_SELECTION_NOTE" "$vitest" run "$@"
 }
 
 if [ "${JIG_VERIFY_EXPLAIN:-}" = 1 ]; then
@@ -349,9 +410,10 @@ if [ "${JIG_VERIFY_EXPLAIN:-}" = 1 ]; then
     runner_bin=""
     if [ -n "$runner" ]; then runner_bin=$(_node_local_bin "$runner"); fi
     if [ -z "$runner_bin" ]; then
-      jp_plan "$TEST_LABEL" full "no local supported runner for narrowing"
+      jp_plan_full "$TEST_LABEL" "no local supported runner for narrowing"
     elif [ "$runner" = jest ]; then
-      filters=$(jp_decide _node_builtin_jest)
+      jp_select _node_builtin_jest
+      filters=$JP_SELECTION
       if [ -n "$filters" ] && [ "$filters" != ALL ]; then
         while IFS= read -r f; do
           [ -n "$f" ] || continue
@@ -361,12 +423,19 @@ $filters
 EOF
       fi
       if [ -n "$filters" ] && [ "$filters" != ALL ]; then
-        jp_plan "$TEST_LABEL" conditional "related tests for $(printf '%s\n' "$filters" | paste -sd, -) require jest --listTests; full set possible"
+        # Under `ci` a full set is never run here: the cases that would are skips.
+        possible="; full set possible"
+        if jp_ci_runs_full; then possible=""; fi
+        jp_plan "$TEST_LABEL" conditional "related tests for $(printf '%s\n' "$filters" | paste -sd, -) require jest --listTests$JP_SELECTION_NOTE$possible"
+      elif [ "$filters" = ALL ]; then
+        jp_plan_select "$TEST_LABEL" "$filters" "test files" \
+          "$(_node_all_reason "$(jp_decide_cause _node_builtin_jest)")"
       else
-        jp_plan_selection "$TEST_LABEL" "$filters" "test files"
+        jp_plan_select "$TEST_LABEL" "$filters" "test files"
       fi
     else
-      filters=$(jp_decide _node_builtin_vitest)
+      jp_select _node_builtin_vitest
+      filters=$JP_SELECTION
       if [ -n "$filters" ] && [ "$filters" != ALL ]; then
         while IFS= read -r f; do
           [ -n "$f" ] || continue
@@ -375,7 +444,12 @@ EOF
 $filters
 EOF
       fi
-      jp_plan_selection "$TEST_LABEL" "$filters" "test files"
+      if [ "$filters" = ALL ]; then
+        why=$(_node_all_reason "$(jp_decide_cause _node_builtin_vitest)")
+      else
+        why=
+      fi
+      jp_plan_select "$TEST_LABEL" "$filters" "test files" "$why"
     fi
   fi
 
@@ -385,7 +459,7 @@ EOF
     eslint_bin=""
     if _node_lint_uses_eslint; then eslint_bin=$(_node_local_bin eslint); fi
     if [ -z "$eslint_bin" ] || ! jp_scoped || _node_all_glob_changed; then
-      jp_plan "$LINT_LABEL" full "lint script or project configuration requires full set"
+      jp_plan_full "$LINT_LABEL" "lint script or project configuration requires full set"
     else
       # shellcheck disable=SC2086
       files=$(jp_changed $NODE_TEST_EXTS)
@@ -400,7 +474,7 @@ EOF
   if ! _node_has_script typecheck || [ -z "$MGR_BIN" ]; then
     jp_plan "$TYPECHECK_LABEL" skip "no typecheck script or $MGR not found"
   else
-    jp_plan "$TYPECHECK_LABEL" full "typecheck cannot narrow by file"
+    jp_plan_full "$TYPECHECK_LABEL" "typecheck cannot narrow by file"
   fi
   exit 0
 fi
@@ -416,7 +490,8 @@ else
     runner_bin=""
     [ -z "$runner" ] || runner_bin=$(_node_local_bin "$runner")
     if [ -z "$runner" ] || [ -z "$runner_bin" ]; then
-      _node_full_test "$mgr_v, scope: not narrowable, ran full set"
+      jp_full_left_to_ci "$TEST_LABEL" "not narrowable" \
+        || _node_full_test "$mgr_v, scope: not narrowable, ran full set"
     else
       case "$runner" in
         jest) _node_test_via_jest "$runner_bin" "$mgr_v" ;;
@@ -439,11 +514,12 @@ else
   if [ -z "$eslint_bin" ]; then
     note="$mgr_v"
     if jp_scoped; then note="$mgr_v, scope: not narrowable, ran full set"; fi
-    _node_full_lint "$note"
+    jp_full_left_to_ci "$LINT_LABEL" "not narrowable" || _node_full_lint "$note"
   elif ! jp_scoped; then
     _node_full_lint "$mgr_v"
   elif _node_all_glob_changed; then
-    _node_full_lint "$mgr_v, scope: project configuration changed, whole project"
+    jp_full_left_to_ci "$LINT_LABEL" "project configuration changed" \
+      || _node_full_lint "$mgr_v, scope: project configuration changed, whole project"
   else
     # shellcheck disable=SC2086
     files=$(jp_changed $NODE_TEST_EXTS)
@@ -472,7 +548,7 @@ else
   mgr_v=$(jp_version "$MGR_BIN" --version)
   note="$mgr_v"
   if jp_scoped; then note="$mgr_v, scope: not narrowable, ran full set"; fi
-  _node_full_typecheck "$note"
+  jp_full_left_to_ci "$TYPECHECK_LABEL" "not narrowable" || _node_full_typecheck "$note"
 fi
 
 jp_end

@@ -1,6 +1,18 @@
 # Reader/writer for .ai/manifest (domains/install, ADR-0003). Sourced by
 # scripts/lib/init.sh, scripts/lib/upgrade.sh and scripts/lib/status.sh.
 # Assumes JIG_PROJECT and JIG_AI_DIR are already set (jig_require_repo).
+#
+# Line endings: every reader here strips a trailing \r before comparing or
+# splitting a line, the way section.sh already does for the marked
+# instructions section (ADR-0037). A CRLF `.ai/manifest` — a clone made by
+# Git for Windows with core.autocrlf=true and nothing pinning the manifest to
+# LF (templates/gitattributes) — otherwise never matches the `---` separator,
+# and the whole manifest reads as empty rather than as one bad hash per file.
+# This tolerance is a second line of defence, not the fix: the hashes
+# themselves are still raw bytes of the framework files jig placed, so a
+# CRLF checkout of *those* still reads as changed until the pinning above
+# takes hold. Pinning the manifest itself is what upgrade's preflight checks
+# for (scripts/lib/upgrade.sh, _upgrade_stop_reasons).
 # shellcheck shell=bash
 
 # manifest_file
@@ -22,6 +34,7 @@ manifest_header_get() {
   file=$(manifest_file)
   [ -f "$file" ] || return 0
   while IFS= read -r line; do
+    line="${line%$'\r'}"
     [ "$line" = "---" ] && break
     case "$line" in
       "$key":*)
@@ -42,6 +55,7 @@ manifest_paths() {
   file=$(manifest_file)
   [ -f "$file" ] || return 0
   while IFS= read -r line; do
+    line="${line%$'\r'}"
     if [ "$in_body" = 1 ]; then
       [ -n "$line" ] && printf '%s\n' "${line#* }"
     elif [ "$line" = "---" ]; then
@@ -58,7 +72,7 @@ manifest_entries() {
   local file
   file=$(manifest_file)
   [ -f "$file" ] || return 0
-  awk 'body { if ($0 != "") print; next } $0 == "---" { body = 1 }' "$file"
+  awk '{ sub(/\r$/, "") } body { if ($0 != "") print; next } $0 == "---" { body = 1 }' "$file"
 }
 
 # manifest_hash_of <path>
@@ -69,6 +83,7 @@ manifest_hash_of() {
   file=$(manifest_file)
   [ -f "$file" ] || return 0
   while IFS= read -r line; do
+    line="${line%$'\r'}"
     if [ "$in_body" = 1 ]; then
       [ -z "$line" ] && continue
       hash="${line%% *}"
@@ -120,6 +135,7 @@ manifest_write_entries() {
   [ "$source_real" = "$project_real" ] && source="."
   file=$(manifest_file)
   tmp="$file.tmp.$$"
+  jig_cleanup_add "$tmp"
   mkdir -p "$(dirname "$file")"
   {
     # shellcheck disable=SC2016

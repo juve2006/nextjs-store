@@ -27,7 +27,7 @@ cmd_measure() {
 
   _MEASURE_TMP=$(mktemp -d "${TMPDIR:-/tmp}/jig-measure.XXXXXX") \
     || jig_die "measure: cannot create a temporary directory"
-  trap '[ -n "${_MEASURE_TMP:-}" ] && rm -rf "$_MEASURE_TMP"' EXIT INT TERM
+  jig_cleanup_add -d "$_MEASURE_TMP"
 
   _measure_knowledge
   _measure_collect_tasks

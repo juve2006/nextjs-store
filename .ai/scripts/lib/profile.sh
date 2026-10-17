@@ -232,6 +232,89 @@ jp_decide_cause() {
   return 0
 }
 
+# --- the full set under `verify.full_run: ci` ---------------------------------
+#
+# A project that declares `verify.full_run: ci` has said CI runs every check on
+# each pull request, and its owner wants the full set run there and nowhere else
+# unasked (adr-0041, amendment 2026-10-08). So a narrowed run never starts a
+# check's full set: what it can name it runs, the full set it leaves to CI and
+# says so on the check's line. `jig verify --full` (and a non-empty CI) runs the
+# profile unnarrowed, where none of this applies. The skip line's reason starts
+# with `scope:`, so `jig verify` counts it as narrowing, never as a missing tool.
+# New functions rather than new meanings for jp_decide or jp_run: a profile a
+# user edited keeps running the full set, as it was written to.
+
+JP_SELECTION=""
+JP_SELECTION_NOTE=""
+
+# jp_ci_runs_full — exit 0 when this run is narrowed and the project declared
+# `verify.full_run: ci`: the full set belongs to CI.
+jp_ci_runs_full() {
+  jp_scoped && [ "${JIG_VERIFY_FULL_RUN:-}" = ci ]
+}
+
+# jp_select <builtin-fn> — jp_decide's answer in JP_SELECTION, with what the
+# narrowed run must say about it in JP_SELECTION_NOTE. Under `ci` an ALL beside
+# filters is dropped: the filters run here, the full set is left to CI, and
+# JP_SELECTION_NOTE is ", full set left to CI" for the check's line. ALL alone
+# stays ALL, for the caller to hand to jp_full_left_to_ci. Called as a command,
+# never inside `$( )`: it sets globals.
+# shellcheck disable=SC2034  # JP_SELECTION is read by the profile that sourced this
+jp_select() {
+  local raw rest
+  JP_SELECTION=""
+  JP_SELECTION_NOTE=""
+  jp_scoped || return 0
+  raw=$(_jp_decide_raw "$1")
+  if ! jp_has_line ALL "$raw"; then
+    JP_SELECTION=$(printf '%s\n' "$raw" | sed '/^$/d' | LC_ALL=C sort -u)
+    return 0
+  fi
+  JP_SELECTION=ALL
+  jp_ci_runs_full || return 0
+  rest=$(printf '%s\n' "$raw" | sed -e '/^ALL$/d' -e '/^$/d' | LC_ALL=C sort -u)
+  if [ -n "$rest" ]; then
+    JP_SELECTION="$rest"
+    JP_SELECTION_NOTE=", full set left to CI"
+  fi
+  return 0
+}
+
+# jp_full_left_to_ci <check> <why> — at a point where a narrowed run would start
+# <check>'s full set because of <why>: under `ci`, print the check's skip line
+# and exit 0, so the caller runs nothing; otherwise exit 1 and the caller runs
+# the full set as before. Use as `jp_full_left_to_ci "$c" "$why" || jp_run …`.
+jp_full_left_to_ci() {
+  jp_ci_runs_full || return 1
+  printf '%s: %s: skip (scope: %s, full set left to CI)\n' "$JP_PROFILE" "$1" "$2"
+  return 0
+}
+
+# jp_plan_full <check> <reason> — the explain line for a check whose narrowed
+# run needs the full set: `full` as jp_plan always said, `skip` under `ci`.
+jp_plan_full() {
+  if jp_ci_runs_full; then
+    jp_plan "$1" skip "scope: $2, full set left to CI"
+  else
+    jp_plan "$1" full "$2"
+  fi
+}
+
+# jp_plan_select <check> <selection> <label> [reason] — jp_plan_selection for a
+# selection jp_select made: an ALL goes through jp_plan_full, and filters that
+# stand in for a dropped ALL say the full set is left to CI.
+jp_plan_select() {
+  local check="$1" selection="$2" label="$3" reason="${4:-}" listed
+  if jp_scoped && [ "$selection" = ALL ]; then
+    jp_plan_full "$check" "${reason:-changed paths require the full set}"
+  elif jp_scoped && [ -n "$selection" ] && [ -n "$JP_SELECTION_NOTE" ]; then
+    listed=$(printf '%s\n' "$selection" | paste -sd, -)
+    jp_plan "$check" filtered "$label: $listed$JP_SELECTION_NOTE"
+  else
+    jp_plan_selection "$@"
+  fi
+}
+
 # jp_path_matches <path> <glob-list> — exit 0 when <path> matches one of the
 # space-separated globs in <glob-list> (`*` crosses `/`). The list is split
 # with pathname expansion off: `for g in $list` would otherwise expand
@@ -295,13 +378,48 @@ jp_files() {
   return 0
 }
 
+# jp_exec <cmd...> — run a command where the project runs. `jig verify`
+# hands a profile that declares `scope: [..., environment]` the command prefix
+# that reaches the project's environment as JIG_RUN_EXEC (`docker compose exec
+# -T -w /app app`), and the command runs through it; with no prefix it runs as
+# is, on this machine. A profile that does not declare the capability never
+# receives one, so for it this is exactly "$@"
+# (adr-20261001-checks-run-where-the-project-runs). The prefix is plain words,
+# split on blanks and never globbed. Stdin is closed under a prefix: `docker
+# compose exec` would otherwise read the input of the loop a profile calls it
+# from.
+jp_exec() {
+  local -a pre
+  if [ -z "${JIG_RUN_EXEC:-}" ]; then
+    "$@"
+    return
+  fi
+  read -r -a pre <<EOF
+$JIG_RUN_EXEC
+EOF
+  "${pre[@]}" "$@" </dev/null
+}
+
+# jp_have <cmd> — exit 0 when <cmd> can be run where the project runs: the
+# environment's own `command -v` under a prefix, this shell's otherwise. A
+# profile that probes with `command -v` asks the host, which under a container
+# environment is the wrong machine.
+jp_have() {
+  if [ -z "${JIG_RUN_EXEC:-}" ]; then
+    command -v "$1" >/dev/null 2>&1
+    return
+  fi
+  # shellcheck disable=SC2016  # $1 is the inner shell's argument, by design
+  jp_exec sh -c 'command -v "$1" >/dev/null 2>&1' sh "$1" >/dev/null 2>&1
+}
+
 # jp_version <cmd...> — the first non-empty line of a tool's version answer
 # (Gradle's banner starts with a blank line), or `unknown`. Never fails the
 # profile: a tool that cannot answer --version must not abort the check it
 # only annotates (domains/verify RULES).
 jp_version() {
   local v
-  v=$("$@" 2>/dev/null | sed '/^[[:space:]]*$/d' | sed -n '1p') || v=""
+  v=$(jp_exec "$@" 2>/dev/null | sed '/^[[:space:]]*$/d' | sed -n '1p') || v=""
   [ -n "$v" ] || v="unknown"
   printf '%s\n' "$v"
 }
@@ -322,7 +440,7 @@ jp_run() {
   shift 2
   [ -z "$note" ] || suffix=" ($note)"
   JP_RAN=1
-  "$@" || rc=$?
+  jp_exec "$@" || rc=$?
   if [ "$rc" -eq 0 ]; then
     printf '%s: %s: pass%s\n' "$JP_PROFILE" "$check" "$suffix"
   elif [ "$rc" -ge 128 ]; then

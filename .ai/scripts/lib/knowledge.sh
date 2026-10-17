@@ -20,7 +20,7 @@ KM_USAGE="usage: jig knowledge check [--quiet]
        jig knowledge reviewed <id> [--date YYYY-MM-DD]
        jig knowledge sources [--diff <id>]
        jig knowledge adr-convention
-       jig knowledge changed --base <ref> | --task <id>"
+       jig knowledge changed --base <ref> | --task <id> [--to-review]"
 
 # Directory holding the project's knowledge; set once by cmd_knowledge so
 # every subcommand and the path builder below agree on the root.
@@ -37,14 +37,18 @@ cmd_knowledge() {
   jig_require_init
   km_init
 
+  # A command that changes what the status page counts (proposed documents,
+  # changed sources, stale documents) recounts and redraws it, as the task
+  # and spec commands do (jig_status_page_touch, common.sh); --full because
+  # the counts are cached between full runs.
   case "$sub" in
     check) km_check "$@" ;;
-    new) km_new "$@" ;;
+    new) km_new "$@"; jig_status_page_touch --full ;;
     paths) km_paths "$@" ;;
     stale) km_stale "$@" ;;
-    reviewed) km_reviewed "$@" ;;
-    accept) km_accept "$@" ;;
-    reject) km_reject "$@" ;;
+    reviewed) km_reviewed "$@"; jig_status_page_touch --full ;;
+    accept) km_accept "$@"; jig_status_page_touch --full ;;
+    reject) km_reject "$@"; jig_status_page_touch --full ;;
     proposed) km_proposed "$@" ;;
     summary) km_summary "$@" ;;
     stages) km_stages "$@" ;;
@@ -58,13 +62,11 @@ cmd_knowledge() {
 # --- helpers -----------------------------------------------------------------
 
 # km_glob_matches <glob> — exit 0 when the glob matches at least one path in
-# the repository (excluding .git/).
+# the repository. jig_glob_matches_repo (common.sh) is the one matcher this
+# and context.sh both call, over one shared tree walk (jig_repo_files) instead
+# of a `find` per glob.
 km_glob_matches() {
-  local glob="$1" pattern hit
-  pattern=$(jig_glob_pattern "$glob")
-  hit=$(find "$JIG_PROJECT" -path "$JIG_PROJECT/.git" -prune -o \
-    -path "$JIG_PROJECT/$pattern" -print -quit 2>/dev/null)
-  [ -n "$hit" ]
+  jig_glob_matches_repo "$1"
 }
 
 # km_id_known <id> <ids_file> — exit 0 when <id> is a line in <ids_file>.
@@ -82,7 +84,7 @@ KM_LIST_FILE=""
 KM_IDS_FILE=""
 KM_IDS_ALL_FILE=""
 KM_ADR_NUMS_FILE=""
-# Held by km_paths_report's EXIT trap, which fires after the function has
+# Removed by the exit cleanup (jig_cleanup_add), which runs after the function has
 # returned — so it must not be `local` (convention-shell).
 KM_UNCOVERED_FILE=""
 
@@ -517,6 +519,7 @@ km_accept() {
     [ -n "$src" ] || continue
     if [ -z "$tracked" ]; then
       tracked=$(mktemp "${TMPDIR:-/tmp}/jig-knowledge-tracked.XXXXXX")
+      jig_cleanup_add "$tracked"
       km_tracked_list "$tracked" || { rm -f "$tracked"; jig_die "knowledge accept: could not list the files git tracks"; }
     fi
     if [ -n "$(km_source_problem "$src")" ] || ! km_source_tracked "$src" "$tracked"; then
@@ -696,7 +699,7 @@ km_inventory() {
 
   # Script-global: the EXIT trap runs after this function has returned.
   KM_INV_TMP=$(mktemp -d "${TMPDIR:-/tmp}/jig-knowledge-inventory.XXXXXX")
-  trap 'if [ -n "${KM_INV_TMP:-}" ]; then rm -rf "$KM_INV_TMP"; fi' EXIT INT TERM
+  jig_cleanup_add -d "$KM_INV_TMP"
   inv="$KM_INV_TMP"
 
   # Every listing is read with -z: without it git quotes a non-ASCII name
@@ -984,7 +987,13 @@ km_check() {
   KM_META_FILE=$(mktemp "${TMPDIR:-/tmp}/jig-knowledge-meta.XXXXXX")
   KM_TRACKED_FILE=$(mktemp "${TMPDIR:-/tmp}/jig-knowledge-tracked.XXXXXX")
   KM_SOURCES_FILE=$(mktemp "${TMPDIR:-/tmp}/jig-knowledge-sources.XXXXXX")
-  trap 'rm -f "$KM_LIST_FILE" "$KM_IDS_FILE" "$KM_IDS_ALL_FILE" "$KM_ADR_NUMS_FILE" "$KM_META_FILE" "$KM_TRACKED_FILE" "$KM_SOURCES_FILE"' EXIT INT TERM
+  jig_cleanup_add "$KM_LIST_FILE"
+  jig_cleanup_add "$KM_IDS_FILE"
+  jig_cleanup_add "$KM_IDS_ALL_FILE"
+  jig_cleanup_add "$KM_ADR_NUMS_FILE"
+  jig_cleanup_add "$KM_META_FILE"
+  jig_cleanup_add "$KM_TRACKED_FILE"
+  jig_cleanup_add "$KM_SOURCES_FILE"
 
   # One git call for every linked source in the knowledge base, not one per stub
   # (convention-shell).
@@ -1133,16 +1142,22 @@ km_doc_by_id() {
 # `--base` is required, following `task changes` (ADR-0022): where to count
 # from is a decision, not something a command may guess. `--task` supplies it
 # from the task's own fork point when that exists.
+#
+# `--to-review` prints only the linked sources that wait for a human, as the
+# block a pull request carries (km_changed_sources_block) — what `task
+# autopilot report` runs as a process and `jig-consolidate` pastes for a ship
+# outside autopilot.
 km_changed() {
   jig_require_init
-  local base="" task_id="" line status rel old_rel seen=""
+  local base="" task_id="" to_review=0 line status rel old_rel seen=""
   local created=0 modified=0 deleted=0 renamed=0
 
   while [ $# -gt 0 ]; do
     case "$1" in
       --base) [ $# -ge 2 ] || jig_die "knowledge changed: --base requires a value"; base="$2"; shift 2 ;;
       --task) [ $# -ge 2 ] || jig_die "knowledge changed: --task requires a value"; task_id="$2"; shift 2 ;;
-      *) jig_die "usage: jig knowledge changed --base <ref> | --task <id>" ;;
+      --to-review) to_review=1; shift ;;
+      *) jig_die "usage: jig knowledge changed --base <ref> | --task <id> [--to-review]" ;;
     esac
   done
 
@@ -1155,8 +1170,12 @@ km_changed() {
     [ -n "$base" ] \
       || jig_die "knowledge changed: task $task_id has no base_commit; pass --base <ref>"
   fi
-  [ -n "$base" ] || jig_die "usage: jig knowledge changed --base <ref> | --task <id>"
+  [ -n "$base" ] || jig_die "usage: jig knowledge changed --base <ref> | --task <id> [--to-review]"
   base=$(jig_review_commit "$base" "knowledge changed")
+  if [ "$to_review" -eq 1 ]; then
+    km_changed_sources_block "$base"
+    return 0
+  fi
 
   local kdir="$JIG_AI_DIR/knowledge"
 
@@ -1216,6 +1235,7 @@ $rel"*) continue ;; esac
   sources=$(km_stub_sources)
   if [ -n "$sources" ]; then
     src_list=$(mktemp "${TMPDIR:-/tmp}/jig-knowledge-changed.XXXXXX")
+    jig_cleanup_add "$src_list"
     printf '%s\n' "$sources" | awk -F '\t' '{ print ":(literal)" $1 }' > "$src_list"
     while IFS= read -r line; do
       [ -n "$line" ] || continue
@@ -1278,6 +1298,55 @@ km_stub_sources() {
 km_source_note() {
   printf '%s\n' "$2" | awk -F '\t' -v s="$1" '$1 == s {
     printf "source of %s%s\n", $2, ($3 == "adr" ? ", a decision record" : ""); exit }'
+}
+
+# km_changed_sources_block <base> — `knowledge changed --to-review`: the
+# "Changed linked sources" block that `jig task autopilot <id> report` shows
+# and the skills copy into the pull request, so a human sees before the merge
+# that a file a stub links was edited and waits for them (`jig-accept`).
+# Nothing at all when no linked source changed since <base>, or when the
+# changes cannot be read: the block informs and never blocks.
+#
+# The edits are km_changed's `source of` lines, not a second diff. One line per
+# stub, since one file may be linked by several; a stub whose source is `ok`
+# in km_source_states was approved since the edit and needs nobody, and a
+# retired stub (rejected, superseded) asks nothing of anyone.
+km_changed_sources_block() {
+  local base="$1" edits states status src state doc id size added removed rest note out="" t
+  t=$(printf '\t')
+  edits=$(km_changed --base "$base" 2>/dev/null) || return 0
+  edits=$(printf '%s\n' "$edits" | awk -v t="$t" '/  \(source of / {
+    r = $0; sub(/^[a-z]+ +/, "", r); sub(/  \(source of .*$/, "", r); print $1 t r }')
+  [ -n "$edits" ] || return 0
+  states=$(km_source_states 2>/dev/null) || return 0
+  while IFS="$t" read -r status src; do
+    [ -n "$src" ] || continue
+    while IFS="$t" read -r state doc rest; do
+      [ "$rest" = "$src" ] || continue
+      case "$state" in changed | unrecorded | missing | proposed) ;; *) continue ;; esac
+      id=$(fm_get "$doc" id)
+      size=""
+      if [ "$status" = deleted ]; then
+        :
+      elif git -C "$JIG_PROJECT" ls-files --error-unmatch -- ":(literal)$src" >/dev/null 2>&1; then
+        added="" removed=""
+        IFS="$t" read -r added removed _ < <(git -C "$JIG_PROJECT" diff --numstat "$base" -- ":(literal)$src" 2>/dev/null)
+        case "$added" in '' | -) ;; *) size=", +$added -$removed" ;; esac
+      elif [ -f "$JIG_PROJECT/$src" ]; then
+        size=", +$(wc -l < "$JIG_PROJECT/$src" | tr -d ' ')"
+      fi
+      note=""
+      [ "$(fm_get "$doc" type)" != adr ] || note=", a decision record"
+      out="$out
+- $id: $src ($status$size$note) — jig knowledge sources --diff $id"
+    done <<EOF
+$states
+EOF
+  done <<EOF
+$edits
+EOF
+  [ -n "$out" ] || return 0
+  printf 'Changed linked sources — need your review (jig-accept):%s\n' "$out"
 }
 
 # km_adr_convention — where a project keeps its own decision records, and how it
@@ -1572,6 +1641,7 @@ km_new() {
     problem=$(km_source_problem "$source")
     [ -z "$problem" ] || jig_die "knowledge new: invalid --source '$source': $problem"
     tracked=$(mktemp "${TMPDIR:-/tmp}/jig-knowledge-tracked.XXXXXX")
+    jig_cleanup_add "$tracked"
     if ! km_tracked_list "$tracked"; then
       rm -f "$tracked"
       jig_die "knowledge new: could not list the files git tracks"
@@ -1660,6 +1730,7 @@ km_new() {
     km_new_abandon "$build" "knowledge new: invalid --paths value: $paths_in"
   fi
   mv "$build" "$file" || km_new_abandon "$build" "knowledge new: could not move the finished document into place: $(km_rel "$file")"
+  jig_record_changed
 
   rel=$(km_rel "$file")
   if [ "$has_copy" -eq 1 ]; then
@@ -1769,7 +1840,7 @@ km_copy_build() {
 
 km_paths() {
   case "${1:-}" in
-    add | remove) km_paths_edit "$@" ;;
+    add | remove) km_paths_edit "$@"; jig_status_page_touch --full ;;
     *) km_paths_report "$@" ;;
   esac
 }
@@ -1822,14 +1893,10 @@ km_all_globs() {
 
 # km_file_covered <file> <globs> — exit 0 when any glob matches the path.
 km_file_covered() {
-  local file="$1" globs="$2" glob pattern
+  local file="$1" globs="$2" glob
   while IFS= read -r glob; do
     [ -n "$glob" ] || continue
-    pattern=$(jig_glob_pattern "$glob")
-    # shellcheck disable=SC2254
-    case "$file" in
-      $pattern) return 0 ;;
-    esac
+    jig_path_matches_any "$glob" "$file" && return 0
   done < <(printf '%s\n' "$globs")
   return 1
 }
@@ -1879,7 +1946,7 @@ km_paths_report() {
   globs=$(km_all_globs)
 
   KM_UNCOVERED_FILE=$(mktemp "${TMPDIR:-/tmp}/jig-knowledge-uncovered.XXXXXX")
-  trap 'rm -f "$KM_UNCOVERED_FILE"' EXIT INT TERM
+  jig_cleanup_add "$KM_UNCOVERED_FILE"
 
   while IFS= read -r file; do
     [ -n "$file" ] || continue
@@ -2084,6 +2151,7 @@ km_source_states() {
   local doc src status rows paths hashes t
   t=$(printf '\t')
   rows=$(mktemp "${TMPDIR:-/tmp}/jig-knowledge-sources.XXXXXX")
+  jig_cleanup_add "$rows"
   paths="$rows.paths"
   hashes="$rows.hashes"
   : > "$paths"
@@ -2195,6 +2263,7 @@ km_sources_diff() {
     return 0
   fi
   old=$(mktemp "${TMPDIR:-/tmp}/jig-knowledge-approved.XXXXXX")
+  jig_cleanup_add "$old"
   git -C "$JIG_PROJECT" cat-file -p "$hash" > "$old" \
     || { rm -f "$old"; jig_die "knowledge sources: could not read $hash"; }
   diff -u --label "$src (approved)" --label "$src" "$old" "$JIG_PROJECT/$src" || true

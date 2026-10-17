@@ -27,12 +27,29 @@ fm_block() {
   ' "$file"
 }
 
-# fm_get <file> <key> — print the trimmed scalar value of <key> (trailing
-# `# comment` stripped, surrounding double quotes stripped). Prints nothing
-# when the key is absent or is a list (inline or block).
-fm_get() {
-  local file="$1" key="$2" block raw val
-  block=$(fm_block "$file")
+# A caller reading one document rarely wants one field: `paths`, `domains`,
+# `topics`, `stages`, `id`, `status` in the same loop iteration are the normal
+# case (context.sh's selection, knowledge.sh's validation), and fm_get/fm_list
+# below used to re-read the file and re-run fm_block's `awk` for every one of
+# them. A cache keyed by file, read back on the next call, cannot fix that: a
+# caller almost always holds `$(fm_get ...)` or `$(fm_list ...)`, and a command
+# substitution runs the callee in a *subshell* — any variable it set is gone
+# the instant that subshell exits, before the next call could ever see it
+# (measured: knowledge-costs-one-walk task.md; a cache built that way missed
+# every single time it was tried).
+#
+# fm_get_block/fm_list_block below are the same reader, taking the block as a
+# plain string instead of a file. A caller that wants several fields of one
+# document — exactly the callers above — fetches the block once with
+# `block=$(fm_block "$doc")` in *its own* shell (a local variable a command
+# substitution's exit cannot erase) and passes it to as many of these as it
+# needs, paying for the file read and the block `awk` once per document
+# instead of once per field. fm_get/fm_list stay the one-call, file-taking
+# functions every other caller already uses; they just delegate now.
+
+# fm_get_block <block> <key> — fm_get, given the block already read.
+fm_get_block() {
+  local block="$1" key="$2" raw val
   [ -n "$block" ] || return 0
   raw=$(printf '%s\n' "$block" | sed -n "s/^${key}:[[:space:]]*//p" | head -n 1)
   val=$(printf '%s' "$raw" | sed 's/[[:space:]]*#.*//; s/[[:space:]]*$//')
@@ -43,11 +60,17 @@ fm_get() {
   printf '%s\n' "$val"
 }
 
-# fm_list <file> <key> — print list items one per line, quotes stripped.
+# fm_get <file> <key> — print the trimmed scalar value of <key> (trailing
+# `# comment` stripped, surrounding double quotes stripped). Prints nothing
+# when the key is absent or is a list (inline or block).
+fm_get() {
+  fm_get_block "$(fm_block "$1")" "$2"
+}
+
+# fm_list_block <block> <key> — fm_list, given the block already read.
 # Supports inline `key: [a, b]` and block `key:\n  - a\n  - b` forms.
-fm_list() {
-  local file="$1" key="$2" block inline_content
-  block=$(fm_block "$file")
+fm_list_block() {
+  local block="$1" key="$2" inline_content
   [ -n "$block" ] || return 0
 
   # `grep -c` rather than `grep -q`: counting every match means reading to the
@@ -78,6 +101,12 @@ fm_list() {
       }
     }
   ' | sed 's/[[:space:]]*#.*//; s/[[:space:]]*$//; s/^[[:space:]]*//; s/^"\(.*\)"$/\1/'
+}
+
+# fm_list <file> <key> — print list items one per line, quotes stripped.
+# Supports inline `key: [a, b]` and block `key:\n  - a\n  - b` forms.
+fm_list() {
+  fm_list_block "$(fm_block "$1")" "$2"
 }
 
 # fm_keys <file> — print top-level keys, one per line, in document order.
@@ -171,6 +200,7 @@ _fm_quote_scalar() {
 # an empty document, so a failing awk upstream cannot truncate knowledge.
 _fm_replace() {
   local file="$1" tmp="$1.tmp.$$"
+  jig_cleanup_add "$tmp"
   cat > "$tmp"
   if [ ! -s "$tmp" ]; then
     rm -f "$tmp"
@@ -179,6 +209,15 @@ _fm_replace() {
     return 1
   fi
   mv "$tmp" "$file"
+  # Every frontmatter write lands here, so this is where it raises the clone's
+  # revision (jig_record_changed, common.sh) — except on the file
+  # `knowledge new` is still building (`<doc>.new.<pid>`), which is not a
+  # record until km_new moves it into place and records that. This parser is
+  # also sourced alone, by its own tests, where there is no clone to count in.
+  case "$file" in
+    *.new.[0-9]*) return 0 ;;
+  esac
+  if type jig_record_changed >/dev/null 2>&1; then jig_record_changed; fi
 }
 
 # fm_set <file> <key> <value> — set a scalar key inside the frontmatter,

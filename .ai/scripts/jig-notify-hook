@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# jig-notify-hook <permission|input> — a waiting session's Telegram message
+# (adr-20261010-a-waiting-session-reaches-telegram).
+#
+# Called by the runtime's own notification hook, which the person connected
+# themselves: Claude Code's `Notification` event, `permission_prompt` mapped to
+# `permission`, `idle_prompt` and the elicitation dialogs to `input`. The kind
+# comes from the matcher that called it, so the runtime's JSON is never parsed
+# (ADR-0002 allows a `sed` reader for Jig's own formats only). The one value
+# read from it is a plain `"cwd":"..."` — the checkout the session is working
+# in; with escapes in it (a Windows path) or none at all, the hook's own
+# working directory answers instead.
+#
+# Sends only when `notify.interactive` is `true` and the Telegram keys are set
+# (notify.sh, jig_notify_session); the send itself is detached.
+#
+# Like jig-session-hook, this exits 0 in every circumstance and prints
+# nothing: under Codex a JSON line on a permission hook's stdout would be an
+# answer to the prompt, and under any runtime a hook that fails is a hook that
+# can break the session it is attached to. That is also why it is a script of
+# its own and not `jig notify ...`: the dispatcher records every run as work
+# going on in the checkout (adr-20260924-a-checkout-records-what-is-happening-in-it),
+# and a notification is not work.
+#
+# Deliberate exception to convention-shell's `set -eu` and `set -o pipefail`,
+# for the reason jig-session-hook gives: every giving-up path returns
+# explicitly instead, and `set -u` is the safety net.
+set -u
+
+main() {
+  local kind="${1:-}" self dir payload cwd="" project
+
+  case "$kind" in
+    permission | input) ;;
+    *) return 0 ;;
+  esac
+
+  # The runtime writes its JSON on stdin and expects it read. Never wait on a
+  # terminal: run by hand, there is nothing to read.
+  payload=""
+  if [ ! -t 0 ]; then
+    payload=$(cat 2>/dev/null) || payload=""
+  fi
+  cwd=$(_hook_cwd "$payload")
+  [ -n "$cwd" ] || cwd=$PWD
+
+  self="${BASH_SOURCE[0]}"
+  while [ -L "$self" ]; do
+    dir=$(cd "$(dirname "$self")" && pwd) || return 0
+    self=$(readlink "$self")
+    case "$self" in /*) ;; *) self="$dir/$self" ;; esac
+  done
+  dir=$(cd "$(dirname "$self")" && pwd) || return 0
+  [ -f "$dir/lib/common.sh" ] || return 0
+
+  # Read by the libraries below.
+  # shellcheck disable=SC2034
+  JIG_LIB="$dir/lib"
+  # shellcheck source=lib/common.sh
+  . "$dir/lib/common.sh" || return 0
+  jig_clear_git_location_env
+
+  # The checkout the session works in, not the one this script was found in:
+  # a session that entered a task worktree still names the original project
+  # root in CLAUDE_PROJECT_DIR, and the task is the worktree's.
+  [ -d "$cwd" ] || return 0
+  project=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null) || return 0
+  project=$(cd -P "$project" 2>/dev/null && pwd -P) || return 0
+  [ -f "$project/.ai/config.yaml" ] || return 0
+  # shellcheck disable=SC2034
+  JIG_PROJECT="$project"
+  # shellcheck disable=SC2034
+  JIG_AI_DIR=".ai"
+
+  # shellcheck source=lib/config.sh
+  . "$dir/lib/config.sh" || return 0
+  # shellcheck source=lib/task.sh
+  . "$dir/lib/task.sh" || return 0
+  # shellcheck source=lib/notify.sh
+  . "$dir/lib/notify.sh" || return 0
+  jig_notify_session "$kind"
+  return 0
+}
+
+# _hook_cwd <payload> — the value of a top-level `"cwd": "<path>"` when it
+# holds no quote and no backslash, so nothing in it needs decoding; nothing
+# otherwise.
+_hook_cwd() {
+  local p="$1" v
+  case "$p" in
+    *'"cwd"'*) ;;
+    *) return 0 ;;
+  esac
+  p=${p#*'"cwd"'}
+  p="${p#"${p%%[![:space:]]*}"}"
+  case "$p" in
+    :*) p=${p#:} ;;
+    *) return 0 ;;
+  esac
+  p="${p#"${p%%[![:space:]]*}"}"
+  case "$p" in
+    '"'*) p=${p#'"'} ;;
+    *) return 0 ;;
+  esac
+  v=${p%%'"'*}
+  [ "$v" != "$p" ] || return 0
+  case "$v" in
+    '' | *\\*) return 0 ;;
+  esac
+  printf '%s\n' "$v"
+}
+
+main "$@" >/dev/null 2>&1
+exit 0

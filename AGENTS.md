@@ -62,6 +62,10 @@ lists them with their roadmap progress. A spec released once, at the end, is bui
 epic branch (`jig spec epic`): its tasks are cut from the epic and their pull requests go
 into it.
 
+`jig-release` plans a release with a person: which filed tasks go in, in what order and at what
+version level. A release is a spec with an epic, so the same commands build it; `jig spec link`
+links a task filed earlier, and a started task stays out of the epic.
+
 `jig-autopilot` runs one task's route without waiting between stages and stops only where a
 human is needed; the route, the gates and `agent.git` stay what they are.
 
@@ -81,6 +85,11 @@ the **highest** one whose answers fit; the full test, with examples, is in the `
 | T2 structural | analyze, plan, implement, review, verify, consolidate |
 | T3 architectural | discover, design, human gate, implement, architecture review, verify, consolidate |
 | T4 critical | discover, specify, alternatives, design, human gate, implement, independent review, verify, consolidate |
+
+A person may take less than the full route: `route.depth: lean` in their own settings, or
+`jig task new <id> --lean` for one task. `jig task route <id>` names the route at the task's
+depth. Lean never trims tests on changed files, CI before a merge, consolidation, or the gate
+and architecture review of T3/T4.
 
 Every route ends in consolidation, and a task with a workspace ends it in two records.
 Before the commit, the knowledge decision — `NO_DURABLE_KNOWLEDGE` included — is recorded

@@ -11,13 +11,18 @@
 # disk. Everything else — base branch, profiles, forge — must be the same for
 # every contributor and for CI, so a local value for it is ignored and
 # reported by `jig status`. Adding a key here is a decision about that test,
-# not a convenience; record it in schemas/config.md.
+# not a convenience; record it in schemas/config.md. `git.delete_merged_branches`
+# is one: which of its own branches a clone keeps is that clone's business
+# (adr-20261007-a-merged-branch-leaves-with-its-work).
 #
-# `agent.git`, `agent.ci_timeout`, `autopilot.unattended` and
-# `autopilot.parallel` are also in JIG_CFG_LOCAL_ONLY_KEYS below: they answer
+# `agent.git`, `autopilot.git`, `agent.ci_timeout`, `autopilot.unattended`,
+# `autopilot.parallel` and `route.depth` are also in JIG_CFG_LOCAL_ONLY_KEYS
+# below (with `run.exec`, `run.path` and the `claude.*_model` and
+# `codex.*_model` and `executor.*` keys): they
+# answer
 # *only* from this list, never falling back to the project layer the way every
 # other key here does.
-JIG_CFG_LOCAL_KEYS="housekeeping.cadence housekeeping.fetch housekeeping.trash_ttl housekeeping.abandoned_ttl housekeeping.stale_after checkout.busy_ttl verify.busy_ttl git.worktree_root agent.git agent.ci_timeout autopilot.unattended autopilot.parallel"
+JIG_CFG_LOCAL_KEYS="housekeeping.cadence housekeeping.fetch housekeeping.trash_ttl housekeeping.abandoned_ttl housekeeping.stale_after checkout.busy_ttl verify.busy_ttl git.worktree_root git.delete_merged_branches agent.git autopilot.git agent.ci_timeout autopilot.unattended autopilot.parallel route.depth release.merge run.exec run.path claude.implement_model claude.review_model codex.implement_model codex.review_model executor.implement_runtime executor.review_runtime executor.implement_model executor.review_model notify.telegram.token notify.telegram.chat_id notify.autopilot notify.interactive"
 
 # Keys whose project-layer value `cfg` never reads at all: only the local
 # file and the default answer. A key belongs here, rather than merely in
@@ -25,16 +30,48 @@ JIG_CFG_LOCAL_KEYS="housekeeping.cadence housekeeping.fetch housekeeping.trash_t
 # every contributor the same thing a local key exists to keep personal —
 # `agent.git` grants an agent git rights, and a project-wide grant would make
 # every contributor's agent commit, whether that contributor agreed to it or
-# not (spec: .ai/specs/autopilot/). `autopilot.unattended` lets a run ask
+# not (spec: .ai/specs/autopilot/). `autopilot.git` is the same grant for the
+# shipping an autopilot run does, so a person can trust a run further, or less
+# far, than the work they watch. `autopilot.unattended` lets a run ask
 # nothing and `agent.ci_timeout` bounds how long a merge waits for CI: both
 # decide what one person's agent does on their behalf, for the same reason
 # (adr-20260922-unattended-runs-ask-nothing-and-merge-on-green-ci).
 # `autopilot.parallel` bounds how many task agents a phase run builds at once,
 # which is a question about one person's machine and their tolerance for
 # agents working unwatched, not about the project.
+# `route.depth` trades one person's time against process: `lean` trims the
+# stages a class route allows trimming, never below the class's floor. A
+# committed value would make that trade for every contributor
+# (adr-20261002-route-depth-is-a-personal-choice).
+# `release.merge` says whether this person's unattended agent may merge an
+# epic's final pull request, which is the release: who merges one is the
+# owner's choice, not the project's (this ADR amendment: ADR-0040, 2026-10-04).
+# `run.exec` says where this machine runs the project's checks — a container
+# on one laptop, the host on a colleague's — and a committed value would send
+# every contributor's checks to one person's environment
+# (adr-20261001-checks-run-where-the-project-runs). `run.path` is the same
+# question for a host runtime that is not first on PATH (Laravel Herd): a
+# directory on one person's machine.
+# The `claude.*_model` and `codex.*_model` keys name the model a stage is
+# handed to when the agent delegates it to a subagent: which model is worth
+# its cost depends on one person's plan, runtime and budget, and a committed
+# value would spend every contributor's. Jig carries the value as an opaque
+# string and never interprets it; empty means no delegation
+# (adr-20261005-jig-names-the-roles-not-the-models).
+# `executor.*_runtime` selects which installed runtime owns a stage. This is
+# personal because it chooses a process, account and permission boundary;
+# `executor.*_model` is an optional opaque model for that external process.
+# Neither setting grants the process a new permission in a project config.
+# `notify.telegram.token` and `notify.telegram.chat_id` say where one person's
+# Telegram messages go, and `notify.autopilot` whether their autopilot runs
+# send any: a committed token is a bot anyone can use once it is pushed, and a
+# committed chat id would send every contributor's stops to one person
+# (adr-20261009-autopilot-stops-reach-telegram). `notify.interactive` says
+# whether an ordinary session that waits for them sends one too, through the
+# hook they opted into (adr-20261010-a-waiting-session-reaches-telegram).
 # `jig_config_project_ignored` reports a project-layer value here so it does
 # not silently do nothing.
-JIG_CFG_LOCAL_ONLY_KEYS="agent.git agent.ci_timeout autopilot.unattended autopilot.parallel"
+JIG_CFG_LOCAL_ONLY_KEYS="agent.git autopilot.git agent.ci_timeout autopilot.unattended autopilot.parallel route.depth release.merge run.exec run.path claude.implement_model claude.review_model codex.implement_model codex.review_model executor.implement_runtime executor.review_runtime executor.implement_model executor.review_model notify.telegram.token notify.telegram.chat_id notify.autopilot notify.interactive"
 
 # Path of the config file for the current project (JIG_PROJECT must be set).
 jig_config_file() { printf '%s/%s/config.yaml\n' "$JIG_PROJECT" "$JIG_AI_DIR"; }
@@ -122,8 +159,11 @@ git.base_branch main
 git.branch_per_task true
 git.branch_template task/{id}
 git.worktree_root ../<project>.worktrees
+git.delete_merged_branches true
 worktree.carry []
+worktree.share []
 forge auto
+task.issue_pattern
 housekeeping.cadence 1d
 housekeeping.fetch true
 housekeeping.trash_ttl 7d
@@ -131,12 +171,29 @@ housekeeping.abandoned_ttl 14d
 housekeeping.stale_after 60d
 checkout.busy_ttl 12h
 agent.git none
+autopilot.git
 agent.ci_timeout 30
 autopilot.unattended false
 autopilot.parallel 2
+route.depth full
+release.merge agent
 knowledge.require_frontmatter true
 verify.full_run local
 verify.busy_ttl 30m
+run.exec auto
+run.path auto
+claude.implement_model
+claude.review_model
+codex.implement_model
+codex.review_model
+executor.implement_runtime
+executor.review_runtime
+executor.implement_model
+executor.review_model
+notify.telegram.token
+notify.telegram.chat_id
+notify.autopilot true
+notify.interactive false
 EOF
 }
 
@@ -329,6 +386,27 @@ jig_agent_git() {
   _cfg_agent_git_level "$value"
 }
 
+# jig_autopilot_git — `<level><TAB><key>`: the git level an autopilot run
+# ships at, and the key it came from. `autopilot.git` when this clone sets it,
+# else `agent.git`: nothing has to be filled in, and a clone without the key
+# ships a run exactly as it ships everything else. Exit 1, still printing the
+# value read and its key, when the level is not one of
+# none|commit|push|pr|merge, like jig_agent_git: a set but invalid
+# autopilot.git never falls back to agent.git, because the person who set it
+# did not mean agent.git.
+jig_autopilot_git() {
+  local value
+  value=$(cfg autopilot.git "")
+  if [ -n "$value" ]; then
+    printf '%s\tautopilot.git\n' "$value"
+    _cfg_agent_git_level "$value"
+    return
+  fi
+  value=$(cfg agent.git none)
+  printf '%s\tagent.git\n' "$value"
+  _cfg_agent_git_level "$value"
+}
+
 # _cfg_agent_git_level <value> — exit 0 when <value> is an agent.git level.
 # Shared by the reader above and `jig config set`, so the two cannot disagree.
 _cfg_agent_git_level() {
@@ -386,6 +464,71 @@ jig_autopilot_parallel() {
   printf '%s\n' "$((10#$value))"
 }
 
+# jig_release_merge — print release.merge, who merges an epic's final pull
+# request in an unattended run at `agent.git: merge`: `agent` (the default,
+# as before) or `human`, which opens it and leaves the merge — the release —
+# to the person. Exit 1 with the value read for anything else, which every
+# reader takes as `human`: a mistake never merges a release.
+jig_release_merge() {
+  local value
+  value=$(cfg release.merge agent)
+  if _cfg_release_merge "$value"; then
+    printf '%s\n' "$value"
+  else
+    printf 'human\n'
+    return 1
+  fi
+}
+
+_cfg_release_merge() {
+  case "$1" in
+    agent | human) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# jig_route_depth — print route.depth, how much of a class's route this
+# person runs (`full`, the default, or `lean`), and exit 0; for anything else
+# print the value read and exit 1, like jig_agent_git. Every reader takes an
+# invalid value as `full`: a mistake costs process, never a stage
+# (adr-20261002-route-depth-is-a-personal-choice).
+jig_route_depth() {
+  local value
+  value=$(cfg route.depth full)
+  printf '%s\n' "$value"
+  _cfg_route_depth "$value"
+}
+
+# _cfg_route_depth <value> — exit 0 when <value> is a route depth. Shared by
+# the reader above, `jig config set` and `jig task`, so they cannot disagree.
+_cfg_route_depth() {
+  case "$1" in
+    full | lean) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _cfg_chat_id <value> — exit 0 when <value> is a Telegram chat id: digits,
+# with a leading `-` for a group, or a public `@name`. Shared by `jig config
+# set` and the sender (notify.sh), which checks a value written by hand before
+# it uses it.
+_cfg_chat_id() {
+  case "$1" in
+    @*) case "${1#@}" in '' | *[!A-Za-z0-9_]*) return 1 ;; esac ;;
+    -*) case "${1#-}" in '' | *[!0-9]*) return 1 ;; esac ;;
+    *) case "$1" in '' | *[!0-9]*) return 1 ;; esac ;;
+  esac
+  return 0
+}
+
+# _cfg_secret_key <key> — exit 0 when <key>'s value is a secret no command
+# prints: `jig config show`, `jig config set` and `jig status` print
+# JIG_CFG_MASK in its place (adr-20261009-autopilot-stops-reach-telegram).
+JIG_CFG_MASK='********'
+_cfg_secret_key() {
+  [ "$1" = notify.telegram.token ]
+}
+
 # _cfg_parallel <value> — exit 0 when <value> is a count autopilot.parallel
 # accepts: digits only, 1 to 16. Shared by the reader above and
 # `jig config set`, so the two cannot disagree. The ceiling is not a measured
@@ -406,13 +549,30 @@ _cfg_parallel() {
 # - the other housekeeping durations, checkout.busy_ttl and verify.busy_ttl:
 #   `<n>[dhms]`, `jig_duration_seconds` — `0` is a legal value for
 #   verify.busy_ttl and means "never wait";
-# - housekeeping.fetch and autopilot.unattended: `true` or `false` — cfg_bool
+# - housekeeping.fetch, git.delete_merged_branches and autopilot.unattended:
+#   `true` or `false` — cfg_bool
 #   would take yes/1/on too, jig_unattended only `true`; the one spelling
 #   both read alike;
-# - agent.git and agent.ci_timeout: the checks of jig_agent_git and
+# - agent.git, autopilot.git and agent.ci_timeout: the checks of jig_agent_git and
 #   jig_ci_timeout;
 # - autopilot.parallel: the check of jig_autopilot_parallel;
-# - git.worktree_root: any path _cfg_read gives back unchanged.
+# - route.depth: the check of jig_route_depth;
+# - release.merge: `agent` or `human`;
+# - git.worktree_root: any path _cfg_read gives back unchanged;
+# - run.exec: `auto`, `host` or a command prefix of plain words — runenv.sh
+#   splits it on blanks and interprets nothing, so a quote, `$`, backtick or
+#   backslash would reach the command as a literal character;
+# - run.path: `auto` or the absolute path of a directory, unquoted — read as
+#   one value, so a blank inside it is kept (Herd's macOS home has one); a
+#   relative one would name a different folder from wherever verify starts;
+# - claude.*_model and codex.*_model: anything — the value is
+#   the runtime's to understand, never Jig's
+#   (adr-20261005-jig-names-the-roles-not-the-models);
+# - notify.telegram.chat_id: a chat id, digits with an optional `-`, or an
+#   `@name`; notify.autopilot and notify.interactive: `true` or `false`;
+# - notify.telegram.token: never — a token on a command line is in `ps`, the
+#   shell's history and the agent's transcript, so it is written into the file
+#   by hand (adr-20261009-autopilot-stops-reach-telegram).
 # Nothing may hold a line break, a `#` (_cfg_read cuts a comment there) or
 # surrounding blanks (it trims them).
 jig_config_value_problem() {
@@ -437,13 +597,14 @@ jig_config_value_problem() {
         '' | *[!0-9]* | ?????????*) printf 'not a duration (e.g. 7d, 12h, 30m, 90s)\n'; return 1 ;;
       esac
       ;;
-    housekeeping.fetch | autopilot.unattended)
+    housekeeping.fetch | git.delete_merged_branches | autopilot.unattended | notify.autopilot \
+      | notify.interactive)
       case "$value" in
         true | false) ;;
         *) printf 'not true or false\n'; return 1 ;;
       esac
       ;;
-    agent.git)
+    agent.git | autopilot.git)
       _cfg_agent_git_level "$value" \
         || { printf 'not a level: none, commit, push, pr or merge\n'; return 1; }
       ;;
@@ -455,10 +616,47 @@ jig_config_value_problem() {
       _cfg_parallel "$value" \
         || { printf 'not a whole number of tasks (1 to 16)\n'; return 1; }
       ;;
+    route.depth)
+      _cfg_route_depth "$value" \
+        || { printf 'not a depth: full or lean\n'; return 1; }
+      ;;
+    release.merge)
+      _cfg_release_merge "$value" \
+        || { printf 'not agent or human\n'; return 1; }
+      ;;
+    run.exec)
+      case "$value" in
+        *[\"\'\`\$\\]*)
+          printf 'a quote, $, backtick or backslash; write the command prefix as plain words (e.g. docker compose exec -T app)\n'
+          return 1
+          ;;
+      esac
+      ;;
+    run.path)
+      case "$value" in
+        auto | /* | [A-Za-z]:[\\/]*) ;;
+        *) printf 'not auto or an absolute path of a folder\n'; return 1 ;;
+      esac
+      ;;
     git.worktree_root)
       case "$value" in
         \"* | \'*) printf 'quoted; write the path without quotes\n'; return 1 ;;
       esac
+      ;;
+    executor.implement_runtime | executor.review_runtime)
+      case "$value" in
+        claude | codex) ;;
+        *) printf 'not a runtime: claude or codex\n'; return 1 ;;
+      esac
+      ;;
+    claude.implement_model | claude.review_model | codex.implement_model | codex.review_model | executor.implement_model | executor.review_model) ;;
+    notify.telegram.chat_id)
+      _cfg_chat_id "$value" \
+        || { printf 'not a chat id: digits (a group starts with -), or @name\n'; return 1; }
+      ;;
+    notify.telegram.token)
+      printf 'a bot token is never set on a command line, where ps, the shell history and the transcript keep it; run %s/scripts/jig notify setup in your own terminal, or write the line notify.telegram.token: <token> into %s/config.local.yaml yourself\n' "$JIG_AI_DIR" "$JIG_AI_DIR"
+      return 1
       ;;
     *) printf 'not a local key\n'; return 1 ;;
   esac
@@ -535,7 +733,7 @@ _config_show() {
     printf 'no local settings: %s does not exist\n' "$shown"
     return 0
   fi
-  cat "$file"
+  _config_print_masked "$file"
   # Then the keys in it that no reader answers from — the `ignored` kind of
   # jig_config_local_entries, the same answer `jig status` gives. Printing the
   # file alone showed a misspelt or non-local key as if it were a setting,
@@ -545,6 +743,34 @@ _config_show() {
     $3 == "ignored" {
       printf "ignored: %s (not a local key; jig config unset %s --local)\n", $1, $1
     }'
+}
+
+# _config_print_masked <file> — <file> as it is, except that a secret
+# (_cfg_secret_key) reads JIG_CFG_MASK: what this prints lands in an agent's
+# transcript. Every `config` output that shows the file goes through here —
+# `show`, and the `--dry-run` of `set` and `unset`. Masked twice over: the
+# line that sets the key, and the value itself wherever it appears, read the
+# way `cfg` reads it (_cfg_read matches the key as a pattern, so a line
+# `notify_telegram_token:` answers for it too).
+_config_print_masked() {
+  local secret
+  secret=$(_cfg_read "$1" notify.telegram.token)
+  JIG_CFG_MASK_VALUE="$JIG_CFG_MASK" JIG_CFG_SECRET="$secret" awk '
+    BEGIN { m = ENVIRON["JIG_CFG_MASK_VALUE"]; s = ENVIRON["JIG_CFG_SECRET"]; k = "notify.telegram.token:" }
+    substr($0, 1, length(k)) == k { print k " " m; next }
+    {
+      line = $0
+      if (s != "") {
+        out = ""
+        while ((i = index(line, s)) > 0) {
+          out = out substr(line, 1, i - 1) m
+          line = substr(line, i + length(s))
+        }
+        line = out line
+      }
+      print line
+    }
+  ' "$1"
 }
 
 # _config_keys — `jig config keys`. Every key jig reads, its default, which
@@ -566,6 +792,9 @@ _config_keys() {
   printf '%-31s%-25s%s\n' "key" "default" "answered by"
   while read -r key default; do
     [ -n "$key" ] || continue
+    # An empty default — a key that is off until a person sets it — prints as
+    # `-`, so the columns still read as columns.
+    [ -n "$default" ] || default=-
     note=""
     if ! jig_config_local_only_key "$key" && ! _cfg_mentions "$file" "$key"; then
       note="not mentioned in $JIG_AI_DIR/config.yaml"
@@ -626,6 +855,9 @@ _config_set() {
       jig_die "config set: $key is not a local key; the local file answers only for: $JIG_CFG_LOCAL_KEYS (anything else belongs to the team's .ai/config.yaml, edited by hand)"
     fi
     if ! problem=$(jig_config_value_problem "$key" "$value"); then
+      if _cfg_secret_key "$key"; then
+        jig_die "config set: $key: refused: $problem"
+      fi
       jig_die "config set: $key: invalid value '$value': $problem"
     fi
     i=$((i + 2))
@@ -638,7 +870,8 @@ _config_set() {
   [ -d "$dir" ] || jig_die "config set: no $JIG_AI_DIR/ directory at ${dir%/*}; run jig init there first"
 
   _CONFIG_TMP="$file.tmp.$$"
-  trap 'rm -f "$_CONFIG_TMP" "$_CONFIG_TMP.next"' EXIT
+  jig_cleanup_add "$_CONFIG_TMP"
+  jig_cleanup_add "$_CONFIG_TMP.next"
   if [ -f "$file" ]; then
     cat "$file" > "$_CONFIG_TMP"
   else
@@ -654,13 +887,17 @@ _config_set() {
   done
 
   if [ "$dry" = 1 ]; then
-    cat "$_CONFIG_TMP"
+    _config_print_masked "$_CONFIG_TMP"
     rm -f "$_CONFIG_TMP"
     printf 'config: dry run, nothing written to %s\n' "$shown" >&2
     _config_warn_ignored "$shown"
     return 0
   fi
   mv "$_CONFIG_TMP" "$file"
+  # A setting can change what a read reports (the git level and unattended
+  # mode decide what a person may do next), so a written one raises the
+  # clone's revision.
+  jig_record_changed
   i=0
   while [ "$i" -lt "$n" ]; do
     printf 'config: %s: %s (%s)\n' "${args[i]}" "${args[i + 1]}" "$shown"
@@ -734,7 +971,8 @@ _config_unset() {
   fi
 
   _CONFIG_TMP="$file.tmp.$$"
-  trap 'rm -f "$_CONFIG_TMP" "$_CONFIG_TMP.next"' EXIT
+  jig_cleanup_add "$_CONFIG_TMP"
+  jig_cleanup_add "$_CONFIG_TMP.next"
   cat "$file" > "$_CONFIG_TMP"
   # The report is built here, against the file as it still is, so "unset" and
   # "not set" say what actually happened rather than what was asked for.
@@ -759,8 +997,9 @@ _config_unset() {
     # stdout is the file that would be written and nothing else, as it is for
     # `config set --dry-run`: `jig-setup` shows that output to a person as the
     # file. The per-key lines go to stderr with the dry-run notice, and say
-    # "would unset", because this run removed nothing.
-    cat "$_CONFIG_TMP"
+    # "would unset", because this run removed nothing. A secret still in the
+    # file is masked, as `show` masks it.
+    _config_print_masked "$_CONFIG_TMP"
     rm -f "$_CONFIG_TMP"
     printf '%s' "$report" | sed 's/^config: unset /config: would unset /' >&2
     printf 'config: dry run, nothing written to %s\n' "$shown" >&2
@@ -770,6 +1009,7 @@ _config_unset() {
   # it that it did not already satisfy.
   if [ "$removed" -gt 0 ]; then
     mv "$_CONFIG_TMP" "$file"
+    jig_record_changed
   else
     rm -f "$_CONFIG_TMP"
   fi

@@ -7,12 +7,16 @@
 # its stack's derived state (`carry` in profile.yaml), a project declares its
 # own layout (`worktree.carry` in .ai/config.yaml).
 #
-# One action, and one nature of state: **derived state, each tree's own** —
-# vendor, node_modules, .env — copied from the checkout that owns the worktree.
-# State that must stay single because it is a source of truth under edit, such
-# as a directory of separate repositories wired in as path repositories, is not
-# served by copying and is not carried here at all: see the `worktree-share`
-# task, which holds that analysis whole.
+# Two actions, for two natures of state. **Derived state, each tree's own** —
+# vendor, node_modules, .env — is copied from the checkout that owns the
+# worktree (`carry`). **State that must stay single** because it is a source
+# of truth under edit — a directory of separate repositories wired in as path
+# repositories, say `packages/` — is shared (`worktree.share`): the worktree
+# gets a real directory whose every entry is a link to the owner's, so the
+# work lives in one place and removing the worktree removes only links
+# (adr-20261002-a-worktree-shares-a-directory-by-mirroring-it). A copy would
+# be a second clone, and `git worktree remove` deletes an ignored clone
+# without a word.
 #
 # Sourced by scripts/lib/task.sh, which sources scripts/lib/profiles.sh first.
 # Depends on common.sh (jig_info, jig_warn, jig_copy_dir) and config.sh
@@ -353,8 +357,314 @@ _bootstrap_stale() {
   return 0
 }
 
-# jig_bootstrap_worktree <owner-abs> <tree-abs> <verb> — carry the declared
-# state from the owning checkout into the worktree.
+# _bootstrap_place <tree-root> <staged> <dst> <path> <verb> <carry|share> —
+# put a tree built in the staging directory at its destination, and keep it
+# only if git sees nothing new. Exit 0 when <path> is placed and kept; 1 when
+# it is not, having said why. The staged tree is gone either way: renamed into
+# place, or discarded. Both actions place this way, so the guarantees below
+# are one piece of code and not two that drift.
+#
+# Reads and, when a take-back fails, refreshes _BOOTSTRAP_BASELINE.
+_bootstrap_place() {
+  local tree_root="$1" staged="$2" dst="$3" path="$4" verb="$5" action="$6"
+  local doing done_ again staged_inode nested=0
+  case "$action" in
+    share) doing=sharing; done_=shared; again="run \`jig task bootstrap\`" ;;
+    *) doing=carrying; done_=carried; again="carry it again" ;;
+  esac
+  # The destination is tested again here, not only before the tree was built:
+  # a copy of a large tree takes seconds, and anything that appeared at <dst>
+  # in the meantime would swallow the rename — `mv` moves *into* an existing
+  # directory, which would bury the tree one level down and leave the
+  # destination looking empty while the report said it was placed.
+  if [ -e "$dst" ] || [ -L "$dst" ]; then
+    jig_warn "$verb: $path appeared in the worktree while it was being $done_; left alone"
+    _bootstrap_discard "$_JIG_BOOTSTRAP_STAGING" "$staged" >/dev/null 2>&1 || true
+    return 1
+  fi
+  staged_inode=$(_bootstrap_inode "$staged")
+  if ! mv "$staged" "$dst" 2>/dev/null; then
+    case "$action" in
+      share) jig_warn "$verb: could not share $path into the worktree" ;;
+      *) jig_warn "$verb: could not carry $path into the worktree" ;;
+    esac
+    _bootstrap_discard "$_JIG_BOOTSTRAP_STAGING" "$staged" >/dev/null 2>&1 || true
+    return 1
+  fi
+  # **Second echelon, and only that.** What closes the race is the re-test
+  # immediately before the `mv` above — measured against a real copy with a
+  # directory planted partway through it. This catches only the sliver
+  # between that test and the rename. Read it as a belt, not the trousers.
+  #
+  # That sliver is reachable by a test because `_bootstrap_inode` is the one
+  # call that happens inside it: a stub that creates <dst> on its way past
+  # makes the rename nest for real, which is what proves this block fires at
+  # all (tests/bootstrap.t.sh).
+  #
+  # **Two bits of evidence, because one is not enough.** A rename nested
+  # only if the object now at <dst>/<staged basename> *is* the staged one
+  # **and** <dst> itself is *not*. Each half alone was tried and each was
+  # wrong in its own direction, both times by truncating a carried tree that
+  # legitimately holds a top-level entry of its own name (`carry: [data]`
+  # over a `data/data/`) while reporting that nothing had been touched — the
+  # exact harm this block exists to prevent.
+  #
+  # The precondition both halves rest on is not a list of platforms but a
+  # property: **reading an inode tells one object from another.** Where that
+  # holds, the conjunction is exact. Where it does not — whatever the reason,
+  # and the reasons outran every list we wrote twice — the two halves cannot
+  # both be satisfied, so the block stands down and the re-test holds the
+  # line. Failing closed is the whole design of it.
+  if [ -n "$staged_inode" ] && [ -e "$dst/${staged##*/}" ] \
+     && [ "$(_bootstrap_inode "$dst/${staged##*/}")" = "$staged_inode" ] \
+     && [ "$(_bootstrap_inode "$dst")" != "$staged_inode" ]; then
+    nested=1
+  fi
+  if [ "$nested" = 1 ]; then
+    mv "$dst/${staged##*/}" "$staged" 2>/dev/null || true
+    jig_warn "$verb: could not put $path in the worktree without nesting it; left alone"
+    _bootstrap_discard "$_JIG_BOOTSTRAP_STAGING" "$staged" >/dev/null 2>&1 || true
+    return 1
+  fi
+  _BOOTSTRAP_MADE="$dst
+"
+  if [ -n "$(_bootstrap_new_dirt "$tree_root" "$_BOOTSTRAP_BASELINE")" ]; then
+    jig_warn "$verb: not $doing $path: git does not ignore it, and anything git can see in a worktree stops that worktree from ever being removed; add it to .gitignore, then $again"
+    if ! _bootstrap_take_back "$tree_root" "$_JIG_BOOTSTRAP_STAGING" \
+         "$_BOOTSTRAP_MADE" "$_BOOTSTRAP_BASELINE"; then
+      jig_warn "$verb: and could not take $path back out; the worktree needs you"
+      _BOOTSTRAP_BASELINE=$(_bootstrap_dirt "$tree_root")
+    fi
+    return 1
+  fi
+  return 0
+}
+
+# What the running bootstrap compares git's answers against: what git
+# reported in the worktree before anything was placed. Cleared here so a value
+# inherited from the environment is never mistaken for one this process set.
+_BOOTSTRAP_BASELINE=""
+
+# _bootstrap_lower <text> — <text> lowercased.
+_bootstrap_lower() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+# _bootstrap_overlap <path> <list> — print the first entry of the
+# newline-separated <list> that is <path>, holds it or lies inside it; exit 1
+# when none does. Compared lowercased, because macOS and NTFS open
+# `Packages/x` as `packages/x`: of two answers, the one that keeps a shared
+# directory from being copied is the safe one.
+_bootstrap_overlap() {
+  local p s
+  p=$(_bootstrap_lower "$1")
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    case "$(_bootstrap_lower "$s")/" in
+      "$p"/*) printf '%s\n' "$s"; return 0 ;;
+    esac
+    case "$p/" in
+      "$(_bootstrap_lower "$s")"/*) printf '%s\n' "$s"; return 0 ;;
+    esac
+  done <<EOF2
+$2
+EOF2
+  return 1
+}
+
+# _bootstrap_link_entry <target-abs> <link-abs> — link one entry of a shared
+# directory. A directory is linked by jig_link_dir: a symlink, or a junction
+# where symlinks cannot be made (ADR-0037). Anything else needs a real
+# symlink, because a junction links only a directory and a copy would
+# diverge from the owner's on the first edit. Exit 2 for exactly that case,
+# 1 for any other failure.
+_bootstrap_link_entry() {
+  if [ -d "$1" ]; then
+    jig_link_dir "$1" "$2"
+    return
+  fi
+  jig_link_detect
+  [ "$_JIG_LINK_KIND" = symlink ] || return 2
+  ln -s "$1" "$2" 2>/dev/null && [ -L "$2" ]
+}
+
+# _bootstrap_entries <dir> — the entries of <dir>, NUL-terminated, hidden ones
+# included. NUL, because an entry's name is nobody's validated input and may
+# hold a newline; the reader decides what to do with one.
+_bootstrap_entries() {
+  find "$1" -mindepth 1 -maxdepth 1 -print0 2>/dev/null
+}
+
+# _bootstrap_report_share <verb> <path> <linked> <failed> <needs-symlink> —
+# one line for one shared path, so a partial run never prints "added" and
+# "could not add" as two messages that read as a contradiction.
+_bootstrap_report_share() {
+  local verb="$1" path="$2" linked="$3" failed="$4" needs="$5" tail=""
+  [ -z "$failed" ] || tail="; could not link $failed"
+  [ -z "$needs" ] || tail="$tail; not linked $needs: a file is shared only by a symbolic link, and this machine cannot make one"
+  if [ -n "$linked" ]; then
+    jig_info "$verb: shared $path: linked $linked$tail"
+  elif [ -n "$tail" ]; then
+    jig_warn "$verb: shared $path: nothing linked${tail}"
+  fi
+}
+
+# _bootstrap_share <owner-root> <tree-root> <path> <verb> — give the worktree
+# a mirror of the owner's directory <path>: a real directory whose every entry
+# is a link to the owner's entry of the same name
+# (adr-20261002-a-worktree-shares-a-directory-by-mirroring-it).
+#
+# A mirror and not a link to the directory, because git does not apply a
+# slashed ignore pattern — `packages/`, the way every project writes it — to a
+# symlink: a linked directory reads as untracked, and `git worktree remove`
+# without --force refuses that worktree for good. A mirror and not a copy,
+# because a copy is a second clone of every repository in it, and the work
+# done there goes, without a word, with the worktree.
+#
+# Placed like a carried path (_bootstrap_place), so git, not a prediction,
+# says whether the mirror may stay. A mirror already in place is topped up
+# with the entries the owner gained since (_bootstrap_top_up).
+_bootstrap_share() {
+  local owner_root="$1" tree_root="$2" path="$3" verb="$4"
+  local src dst staged entry name rc linked="" failed="" needs="" n=0 tracked
+  src="$owner_root/$path"
+  dst="$tree_root/$path"
+
+  if [ ! -e "$src" ] && [ ! -L "$src" ]; then
+    jig_info "$verb: $path is absent in this checkout too, so nothing was shared"
+    return 0
+  fi
+  if [ -L "$src" ]; then
+    jig_warn "$verb: refusing to share $path: it is a link in this checkout"
+    return 0
+  fi
+  if [ ! -d "$src" ]; then
+    jig_warn "$verb: refusing to share $path: it is not a directory, and share mirrors a directory"
+    return 0
+  fi
+  if ! _bootstrap_inside "$owner_root" "$src"; then
+    jig_warn "$verb: refusing to share $path: it resolves outside this checkout"
+    return 0
+  fi
+  if [ -e "$src/.git" ] || [ -L "$src/.git" ]; then
+    jig_warn "$verb: refusing to share $path: it is a git repository itself; share the directory that holds repositories"
+    return 0
+  fi
+  if ! _bootstrap_dest_ok "$tree_root" "$dst"; then
+    jig_warn "$verb: refusing to share $path: in the worktree it resolves outside the tree, or into $JIG_AI_DIR/"
+    return 0
+  fi
+
+  if [ -e "$dst" ] || [ -L "$dst" ]; then
+    # A link, or anything but a directory, is not a mirror: git brought it.
+    if [ -L "$dst" ] || [ ! -d "$dst" ]; then
+      jig_info "$verb: not sharing $path: the worktree already has it, and it is not a directory to mirror into"
+      return 0
+    fi
+    # A directory git tracks anything in is git's, and is never touched. Asked
+    # from inside the directory rather than by pathspec, so the filesystem
+    # decides the case and not the spelling: `git ls-files -- packages` misses
+    # a tracked `Packages` that macOS opens under the declared name. An
+    # unanswered question leaves it alone.
+    if ! tracked=$(git -C "$dst" ls-files 2>/dev/null); then
+      jig_warn "$verb: not sharing $path: git would not say what it tracks there; left alone"
+      return 0
+    fi
+    if [ -n "$tracked" ]; then
+      jig_info "$verb: not sharing $path: git tracks files in it, so the worktree has its own; nothing was linked"
+      return 0
+    fi
+    _bootstrap_top_up "$tree_root" "$src" "$dst" "$path" "$verb"
+    return 0
+  fi
+
+  if ! mkdir -p "$(dirname "$dst")" 2>/dev/null; then
+    jig_warn "$verb: could not make room for $path in the worktree"
+    return 0
+  fi
+  staged="$_JIG_BOOTSTRAP_STAGING/share.$(printf '%s' "$path" | tr '/' '_')"
+  _bootstrap_discard "$_JIG_BOOTSTRAP_STAGING" "$staged" >/dev/null 2>&1 || true
+  if ! mkdir "$staged" 2>/dev/null; then
+    jig_warn "$verb: could not share $path into the worktree"
+    return 0
+  fi
+  while IFS= read -r -d '' entry; do
+    name=${entry##*/}
+    case "$name" in
+      *'
+'*) failed="$failed${failed:+, }(a name holding a newline)"; continue ;;
+    esac
+    rc=0
+    _bootstrap_link_entry "$src/$name" "$staged/$name" || rc=$?
+    case "$rc" in
+      0) n=$((n + 1)) ;;
+      2) needs="$needs${needs:+, }$name" ;;
+      *) failed="$failed${failed:+, }$name" ;;
+    esac
+  done < <(_bootstrap_entries "$src")
+
+  _bootstrap_place "$tree_root" "$staged" "$dst" "$path" "$verb" share || return 0
+  if [ "$n" -gt 0 ]; then
+    linked="$n entries ($_JIG_LINK_KIND)"
+  elif [ -z "$failed" ] && [ -z "$needs" ]; then
+    linked="no entries, the directory is empty"
+  fi
+  _bootstrap_report_share "$verb" "$path" "$linked" "$failed" "$needs"
+  return 0
+}
+
+# _bootstrap_top_up <tree-root> <src> <dst> <path> <verb> — link into the
+# mirror at <dst> each entry of <src> it lacks. The mirror is a snapshot of
+# the owner's entries when it was made; this is how a package the owner
+# gained since reaches the worktree, and it is what `jig task bootstrap` does
+# for a mirror that already exists. Nothing in the mirror is ever replaced:
+# an entry already there, link or not, is left as it is.
+#
+# Each link is made in place — a link is created whole or not at all — and
+# git is asked once afterwards. If git sees anything new, every link this run
+# added is taken back, and the take-back is proved by git as well.
+_bootstrap_top_up() {
+  local tree_root="$1" src="$2" dst="$3" path="$4" verb="$5"
+  local entry name rc added="" failed="" needs=""
+  _BOOTSTRAP_MADE=""
+  while IFS= read -r -d '' entry; do
+    name=${entry##*/}
+    case "$name" in
+      *'
+'*) failed="$failed${failed:+, }(a name holding a newline)"; continue ;;
+    esac
+    if [ -e "$dst/$name" ] || [ -L "$dst/$name" ]; then
+      continue
+    fi
+    rc=0
+    _bootstrap_link_entry "$src/$name" "$dst/$name" || rc=$?
+    case "$rc" in
+      0)
+        _BOOTSTRAP_MADE="$_BOOTSTRAP_MADE$dst/$name
+"
+        added="$added${added:+, }$name"
+        ;;
+      2) needs="$needs${needs:+, }$name" ;;
+      *) failed="$failed${failed:+, }$name" ;;
+    esac
+  done < <(_bootstrap_entries "$src")
+
+  if [ -n "$added" ] && [ -n "$(_bootstrap_new_dirt "$tree_root" "$_BOOTSTRAP_BASELINE")" ]; then
+    jig_warn "$verb: not sharing what $path gained: git does not ignore it, and anything git can see in a worktree stops that worktree from ever being removed; add $path to .gitignore, then run \`jig task bootstrap\`"
+    if ! _bootstrap_take_back "$tree_root" "$_JIG_BOOTSTRAP_STAGING" \
+         "$_BOOTSTRAP_MADE" "$_BOOTSTRAP_BASELINE"; then
+      jig_warn "$verb: and could not take it back out; the worktree needs you"
+      _BOOTSTRAP_BASELINE=$(_bootstrap_dirt "$tree_root")
+    fi
+    return 0
+  fi
+  _bootstrap_report_share "$verb" "$path" "$added" "$failed" "$needs"
+  return 0
+}
+
+# jig_bootstrap_worktree <owner-abs> <tree-abs> <verb> — share and carry the
+# declared state from the owning checkout into the worktree: first every
+# `worktree.share` directory, mirrored; then every carried path, copied.
 #
 # Never fatal, and never a rollback. By the time it runs the task is started,
 # its branch exists and its workspace is linked; a tree that is missing a
@@ -363,9 +673,8 @@ _bootstrap_stale() {
 # and every skip is reported. Always returns 0.
 jig_bootstrap_worktree() {
   local owner="$1" tree="$2" verb="$3"
-  local src dst staged ok source path problem started elapsed baseline
-  local staged_inode nested
-  local carried="" missing="" seen=""
+  local src dst staged ok source path problem started elapsed over
+  local carried="" missing="" seen="" shared_paths=""
   local owner_root tree_root
 
   owner_root=$(cd -P "$owner" 2>/dev/null && pwd -P) || return 0
@@ -377,16 +686,39 @@ jig_bootstrap_worktree() {
   # interrupted carry's remains accumulating: the directory is jig's own, so
   # nothing in it is anyone else's to keep.
   _JIG_BOOTSTRAP_STAGING=$(_bootstrap_staging_root "$tree_root")
-  trap '_bootstrap_sweep' EXIT INT TERM
+  jig_on_exit '_bootstrap_sweep'
   _bootstrap_sweep
   mkdir -p "$_JIG_BOOTSTRAP_STAGING" 2>/dev/null || true
 
-  # What git already reports in this worktree, before the carry touches it. A
+  # What git already reports in this worktree, before anything touches it. A
   # fresh worktree reports nothing; one `jig task bootstrap` runs in may hold a
   # person's own work, and that is theirs, not this run's doing.
-  baseline=$(_bootstrap_dirt "$tree_root")
+  _BOOTSTRAP_BASELINE=$(_bootstrap_dirt "$tree_root")
 
   started=$(date +%s 2>/dev/null || printf '0')
+
+  # Shared first. A directory declared as shared is a source of truth, and the
+  # carry below refuses to copy anything that overlaps one — so every share
+  # declaration that names a path at all counts, whether or not it could be
+  # mirrored this time.
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    path=$(_bootstrap_trim_slash "$path")
+    problem=$(_bootstrap_path_problem "$path") && {
+      jig_warn "$verb: refusing to share $path: $problem"
+      continue
+    }
+    case "$seen" in
+      *"<$path>"*)
+        jig_warn "$verb: $path is declared more than once; shared once"
+        continue
+        ;;
+    esac
+    seen="$seen<$path>"
+    shared_paths="$shared_paths$path
+"
+    _bootstrap_share "$owner_root" "$tree_root" "$path" "$verb"
+  done < <(cfg_list_lines worktree.share)
 
   while IFS="$(printf '\t')" read -r source path; do
     [ -n "$path" ] || continue
@@ -396,6 +728,14 @@ jig_bootstrap_worktree() {
       jig_warn "$verb: refusing to carry $path: $problem"
       continue
     }
+
+    # A copy of a shared directory is the second clone that loses work when the
+    # worktree goes, so of the two declarations the share wins and the copy is
+    # named, not made.
+    if over=$(_bootstrap_overlap "$path" "$shared_paths"); then
+      jig_warn "$verb: not carrying $path: it overlaps $over, which is shared; a copy of shared work would be a second, diverging clone"
+      continue
+    fi
 
     # A path declared twice, or declared both ways, is a configuration
     # mistake worth naming rather than resolving silently.
@@ -436,82 +776,24 @@ jig_bootstrap_worktree() {
       continue
     fi
 
-    # Built beside its destination and renamed into place, so that <dst>
+    # Built in the staging directory and renamed into place, so that <dst>
     # exists only when a carry finished. The loop above reads an existing
     # <dst> as already carried, and cleaning up after the fact cannot be
     # relied on to restore that: a copy keeps the source's modes, so a
     # read-only directory inside a carried tree defeats `rm -rf` while
     # leaving the remains exactly where the next run — `jig task bootstrap`
     # included — would mistake them for finished work. The rename is atomic
-    # and within one directory, so no window exists where <dst> is partial.
+    # and within one filesystem, so no window exists where <dst> is partial.
     # This is conventions/shell.md's rule for the manifest, applied to a tree.
     staged="$_JIG_BOOTSTRAP_STAGING/$(printf '%s' "$path" | tr '/' '_')"
     _bootstrap_discard "$_JIG_BOOTSTRAP_STAGING" "$staged" >/dev/null 2>&1 || true
     ok=0
     jig_copy_dir "$src" "$staged" || ok=1
-    # The destination is tested again here, not only before the copy: a copy
-    # of a large tree takes seconds, and anything that appeared at <dst> in the
-    # meantime would swallow the rename — `mv` moves *into* an existing
-    # directory, which would bury the carried tree one level down and leave the
-    # destination looking empty while the report said it was carried.
-    if [ "$ok" = 0 ] && { [ -e "$dst" ] || [ -L "$dst" ]; }; then
-      jig_warn "$verb: $path appeared in the worktree while it was being carried; left alone"
-      ok=1
-    fi
-    staged_inode=$(_bootstrap_inode "$staged")
-    if [ "$ok" = 0 ] && mv "$staged" "$dst" 2>/dev/null; then
-      # **Second echelon, and only that.** What closes the race is the re-test
-      # immediately before the `mv` above — measured against a real copy with a
-      # directory planted partway through it. This catches only the sliver
-      # between that test and the rename. Read it as a belt, not the trousers.
-      #
-      # That sliver is reachable by a test because `_bootstrap_inode` is the one
-      # call that happens inside it: a stub that creates <dst> on its way past
-      # makes the rename nest for real, which is what proves this block fires at
-      # all (tests/bootstrap.t.sh).
-      #
-      # **Two bits of evidence, because one is not enough.** A rename nested
-      # only if the object now at <dst>/<staged basename> *is* the staged one
-      # **and** <dst> itself is *not*. Each half alone was tried and each was
-      # wrong in its own direction, both times by truncating a carried tree that
-      # legitimately holds a top-level entry of its own name (`carry: [data]`
-      # over a `data/data/`) while reporting that nothing had been touched — the
-      # exact harm this block exists to prevent.
-      #
-      # The precondition both halves rest on is not a list of platforms but a
-      # property: **reading an inode tells one object from another.** Where that
-      # holds, the conjunction is exact. Where it does not — whatever the reason,
-      # and the reasons outran every list we wrote twice — the two halves cannot
-      # both be satisfied, so the block stands down and the re-test holds the
-      # line. Failing closed is the whole design of it.
-      nested=0
-      if [ -n "$staged_inode" ] && [ -e "$dst/${staged##*/}" ] \
-         && [ "$(_bootstrap_inode "$dst/${staged##*/}")" = "$staged_inode" ] \
-         && [ "$(_bootstrap_inode "$dst")" != "$staged_inode" ]; then
-        nested=1
+    if [ "$ok" = 0 ]; then
+      if _bootstrap_place "$tree_root" "$staged" "$dst" "$path" "$verb" carry; then
+        carried="$carried $path"
       fi
-      if [ "$nested" = 1 ]; then
-        mv "$dst/${staged##*/}" "$staged" 2>/dev/null || true
-        jig_warn "$verb: could not put $path in the worktree without nesting it; left alone"
-      else
-        _BOOTSTRAP_MADE="$dst
-"
-        if [ -n "$(_bootstrap_new_dirt "$tree_root" "$baseline")" ]; then
-          jig_warn "$verb: not carrying $path: git does not ignore it, and anything git can see in a worktree stops that worktree from ever being removed; add it to .gitignore, then carry it again"
-          if ! _bootstrap_take_back "$tree_root" "$_JIG_BOOTSTRAP_STAGING" \
-               "$_BOOTSTRAP_MADE" "$baseline"; then
-            jig_warn "$verb: and could not take $path back out; the worktree needs you"
-            baseline=$(_bootstrap_dirt "$tree_root")
-          fi
-        else
-          carried="$carried $path"
-        fi
-        continue
-      fi
-    else
-      if [ "$ok" = 0 ]; then
-        jig_warn "$verb: could not carry $path into the worktree"
-      fi
+      continue
     fi
     _bootstrap_discard "$_JIG_BOOTSTRAP_STAGING" "$staged" >/dev/null 2>&1 || true
   done < <(_bootstrap_declared)

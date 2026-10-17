@@ -9,13 +9,24 @@
 # shellcheck shell=bash
 
 cmd_status() {
-  local mode=text
+  local mode=text arg
+  # `--json` anywhere asks for what needs the reader as data, in the envelope
+  # (lib/json.sh). It is looked for before anything else runs, so that every
+  # refusal below it is an envelope too.
+  for arg in "$@"; do
+    if [ "$arg" = --json ]; then
+      # shellcheck source=lib/json.sh
+      . "$JIG_LIB/json.sh"
+      json_run _status_json "$@"
+      return $?
+    fi
+  done
   while [ $# -gt 0 ]; do
     case "$1" in
       --html) [ "$mode" = open ] || mode=html; shift ;;
       --open) mode=open; shift ;;
       --refresh) mode=refresh; shift ;;
-      *) jig_die "status: unknown argument: $1 (usage: jig status [--html | --open])" ;;
+      *) jig_fail usage "status: unknown argument: $1 (usage: jig status [--html | --open | --json])" ;;
     esac
   done
   jig_require_repo
@@ -24,7 +35,18 @@ cmd_status() {
     return 0
   fi
   _status_load
-  _status_report
+  # shellcheck source=lib/output.sh
+  . "$JIG_LIB/output.sh"
+  out_init
+  # The form is decided here and nowhere below: the plain report
+  # (_status_report) is what every other reader gets — the status page and
+  # every redraw of it, a pipe, an agent — so none of them can be handed the
+  # terminal form (adr-20261005-output-is-decorated-only-on-a-terminal).
+  if out_terminal; then
+    _status_terminal_report
+  else
+    _status_report
+  fi
   # A full report is also when the page's cached counts are refreshed — only
   # where the page lives and only once it exists: `jig status` writes nothing
   # in a project that never asked for the page.
@@ -71,12 +93,18 @@ _status_counts() {
 # saved) now when there are none yet, so a page first written by an older jig
 # pays the full cost once rather than showing nothing.
 _status_counts_cached() {
-  local file="$JIG_PROJECT/$JIG_AI_DIR/runtime/status-counts" key value
-  if [ ! -f "$file" ]; then
+  if ! _status_counts_read; then
     _status_counts
     _status_counts_save || true
-    return 0
   fi
+}
+
+# _status_counts_read — the counts the last full run saved, without computing
+# or writing anything; exit 1 when there are none. `jig status --json` reads
+# them through this alone: a read writes nothing.
+_status_counts_read() {
+  local file="$JIG_PROJECT/$JIG_AI_DIR/runtime/status-counts" key value
+  [ -f "$file" ] || return 1
   _SC_PROPOSALS="" _SC_SOURCES="" _SC_PENDING="" _SC_AT=""
   while IFS= read -r key || [ -n "$key" ]; do
     value=${key#*: }
@@ -95,17 +123,28 @@ _status_counts_cached() {
 }
 
 # _status_counts_save — write the counts for the next redraw, atomically.
+#
+# `jig status --json` reports these counts, so new ones raise the clone's
+# revision (adr-20261016-the-clone-revision-is-a-claimed-name): otherwise a
+# consumer that read the old counts at revision R would see R again after the
+# refresh and never read them. Only when a count changed, not for `at:` alone,
+# which every full redraw moves. jig_revision_bump, not jig_record_changed: this
+# is the page's own redraw, which must not mark the page to redraw again.
 _status_counts_save() {
-  local dir="$JIG_PROJECT/$JIG_AI_DIR/runtime" file tmp
+  local dir="$JIG_PROJECT/$JIG_AI_DIR/runtime" file tmp before="" after
   file="$dir/status-counts"
   tmp="$file.tmp.$$"
+  jig_cleanup_add "$tmp"
   mkdir -p "$dir" || return 1
-  {
-    printf 'at: %s\n' "$_SC_AT"
+  [ ! -f "$file" ] || before=$(sed '/^at: /d' "$file" 2>/dev/null) || before=""
+  after=$(
     printf 'proposals: %s\n' "${_SC_PROPOSALS:-unknown}"
     printf 'sources_changed: %s\n' "${_SC_SOURCES:-unknown}"
     printf 'pending: %s\n' "${_SC_PENDING:-unknown}"
-  } > "$tmp" && mv "$tmp" "$file"
+  )
+  if ! { printf 'at: %s\n' "$_SC_AT"; printf '%s\n' "$after"; } > "$tmp"; then return 1; fi
+  if ! mv "$tmp" "$file"; then return 1; fi
+  [ "$before" = "$after" ] || jig_revision_bump
 }
 
 # _status_load — source the peers whose answers this report consumes
@@ -123,9 +162,17 @@ _status_load() {
   . "$JIG_LIB/spec.sh"
   # shellcheck source=lib/task.sh
   . "$JIG_LIB/task.sh"
+  # After task.sh: its rechecks ask task_state_get.
+  # shellcheck source=lib/hklog.sh
+  . "$JIG_LIB/hklog.sh"
+  # shellcheck source=lib/notify.sh
+  . "$JIG_LIB/notify.sh"
 }
 
-# _status_report — the plain-text report `jig status` prints.
+# _status_report — the plain-text report `jig status` prints. At a terminal
+# the same lines are read back and regrouped by _status_terminal, which knows
+# every line shape printed here: a new one is classified there too, or it is
+# shown as a line of its own under what is fine.
 _status_report() {
   printf '%s\n' "jig $JIG_VERSION"
 
@@ -138,6 +185,8 @@ _status_report() {
   [ -n "$_SC_READY" ] || _status_counts
   _status_config_local
   _status_agent_git
+  _status_autopilot_git
+  _status_notify
 
   if manifest_exists; then
     local proj_version
@@ -147,6 +196,7 @@ _status_report() {
   else
     printf '%s\n' "manifest: missing"
   fi
+  _status_new_release_hint
 
   # Drift: one pass over the manifest, then one git process for every file
   # still on disk (jig_hash_list). A manifest_hash_of and a jig_hash per path
@@ -154,6 +204,7 @@ _status_report() {
   # a git startup for every hash. Both lists stay in manifest order.
   local modified="" missing="" mcount=0 xcount=0 line rel mhash lhash drift_tmp
   drift_tmp=$(mktemp -d "${TMPDIR:-/tmp}/jig-status-drift.XXXXXX")
+  jig_cleanup_add -d "$drift_tmp"
   : > "$drift_tmp/present"
   : > "$drift_tmp/rel"
   while IFS= read -r line; do
@@ -248,6 +299,15 @@ $rel"
     _status_rec "$rec"
     found=1
     line="task $_ST_ID class=$_ST_CLASS status=$_ST_STATUS"
+    # Where `jig task list` shows it (adr-20261010-a-task-carries-its-tracker-issue).
+    [ -z "$_ST_ISSUE" ] || line="$line issue=$_ST_ISSUE"
+    # A lighter route than the class's own is worth a word; `full`, the
+    # default, adds none (adr-20261002-route-depth-is-a-personal-choice).
+    [ "$_ST_DEPTH" != lean ] || line="$line depth=lean"
+    # A class lowered mid-route shows where the class does, so a lowering is
+    # never quieter than the gate it may have skipped
+    # (adr-20261004-a-route-stage-is-proven-by-its-record).
+    [ -z "$_ST_LOWERED" ] || line="$line lowered=$_ST_LOWERED"
     [ -z "$_ST_WT" ] || line="$line $_ST_WT_NOTE"
     # Same rule as `jig task list`: the base only where it is not the project's.
     if [ -n "$_ST_BASE" ] && [ "$_ST_BASE" != "$default_base" ]; then
@@ -269,7 +329,7 @@ $rel"
       [ "$bcount" -eq 0 ] || line="$line blocking=$bcount"
     fi
     # The answer `jig task receipt --check` gives (task_receipt_check,
-    # task.sh), read once per task in _status_live_collect: a receipt that
+    # task.sh, asked `cheap`), read once per task in _status_live_collect: a receipt that
     # exists but no longer matches the reviewed state. A task with no receipt
     # at all is not flagged here — that is "not reviewed yet", not "stale".
     case "$_ST_RECEIPT" in
@@ -317,7 +377,771 @@ EOF
   fi
 
   _status_session_hook
+  _status_notify_hook
   _status_instructions
+}
+
+# --- the terminal form (adr-20261005-output-is-decorated-only-on-a-terminal) ----
+#
+# At a terminal `jig status` is read by section. A heading names the version,
+# the project and the install and ends in the verdict; then what needs the
+# reader — a refusal, a stale or blocked task, a hint, a flag housekeeping
+# left — each with what to do; then a section each for the install, the
+# settings, the tasks, the knowledge and the recent activity in this checkout,
+# one row per item in aligned columns. It is the plain report read back line by
+# line, so the plain form stays byte for byte what it was, and the two forms
+# cannot say different things. Two facts the plain report does not carry are
+# asked in the same process: the project's name, for the heading, and who
+# holds HEAD here (jig_checkout_occupants, the rule every refusal uses).
+
+# What one terminal report tells the reader, filled by _status_terminal.
+_STT_NEED_LEVEL=()   # fail | warn, one per item that needs the reader
+_STT_NEED_TEXT=()    # its status line
+_STT_NEED_DETAIL=()  # its detail lines, "label<TAB>text", newline-joined
+_STT_TASKS=()        # task lines that need nothing, without "task "
+_STT_OTHERS=()       # work recorded here: "label<TAB>command<TAB>age"
+_STT_INSTALL=()      # install rows: "key<TAB>text"
+_STT_KNOW=()         # knowledge rows: "key<TAB>text<TAB>hint"
+_STT_CFG=()          # config.local keys in effect, "key=value"
+_STT_REST=()         # any line no rule here knows
+_STT_HOOKS=()        # session hooks installed, "session hook (claude)"
+_STT_INSTR=()        # runtimes whose instructions are fine
+_STT_INSTR_OWN=()    # runtimes whose Jig section was changed here
+_STT_AGENT=""        # the agent.git line's value, when it is valid
+_STT_AUTOPILOT=""    # the autopilot.git line's value, when it is valid
+_STT_CURRENT=""      # the current task, when it is not ambiguous
+_STT_UNSEEN=""       # 1 when the runtime does not name its sessions
+_STT_MODE=""         # the install's mode (copy, link)
+_STT_CURRENT_FW=""   # 1 when the project's framework is the global one
+_STT_INIT=""         # 1 when the project is initialised
+_STT_NAME=""         # the project's name, for the heading
+_STT_HEAD=""         # who holds HEAD here: "<name> <seconds> <command>"
+
+# _status_terminal_report — the plain report into a file, in this shell (its
+# answers are memoised into globals cmd_status still reads), then its
+# terminal form.
+_status_terminal_report() {
+  local tmp root
+  tmp=$(mktemp "${TMPDIR:-/tmp}/jig-status-report.XXXXXX")
+  jig_cleanup_add "$tmp"
+  _status_report > "$tmp"
+  root=$(jig_config_clone_root)
+  _STT_NAME=${root##*/}
+  _STT_HEAD=$(jig_checkout_occupants)
+  _STT_HEAD=${_STT_HEAD%%$'\n'*}
+  _status_terminal < "$tmp"
+  rm -f "$tmp"
+}
+
+# _status_need <level> <text> — one item that needs the reader.
+_status_need() {
+  _STT_NEED_LEVEL+=("$1")
+  _STT_NEED_TEXT+=("$2")
+  _STT_NEED_DETAIL+=("")
+}
+
+# _status_task_needs <task line> — exit 0 when a `task ...` line asks for the
+# reader: paused, blocking findings, a stale review, a stopped run, a lowered
+# class (adr-20261004-a-route-stage-is-proven-by-its-record). Only the fields
+# the line builder writes are looked at, never the text a person wrote — a
+# worktree path or a pause reason may hold any of those words.
+_status_task_needs() {
+  local t="$1" head last
+  # The fixed words before the worktree, the base and the pause.
+  head=${t%% worktree=*}
+  head=${head%% base=*}
+  head=${head%% paused*}
+  case "$head" in *" lowered="*) return 0 ;; esac
+  # The words after the pause reason, peeled off from the end.
+  while :; do
+    last=${t##* }
+    case "$last" in
+      blocking=*[!0-9]* | blocking=) break ;;
+      blocking=* | review=stale | autopilot=stopped) return 0 ;;
+      autopilot=on) ;;
+      *) break ;;
+    esac
+    t=${t% *}
+  done
+  case "$t" in
+    *" paused" | *" paused ("*")") return 0 ;;
+  esac
+  return 1
+}
+
+# _status_need_detail <label> <text> — a detail line under the last item.
+_status_need_detail() {
+  local i=$((${#_STT_NEED_TEXT[@]} - 1)) d
+  d=${_STT_NEED_DETAIL[$i]}
+  if [ -n "$d" ]; then d="$d"$'\n'; fi
+  _STT_NEED_DETAIL[i]="$d$1"$'\t'"$2"
+}
+
+# _status_terminal — read the plain report on stdin and print its terminal
+# form.
+_status_terminal() {
+  local l t v m version="" prev_need="" list="" finished="" ntasks=0 hk=""
+  _STT_NEED_LEVEL=() _STT_NEED_TEXT=() _STT_NEED_DETAIL=() _STT_TASKS=() _STT_OTHERS=()
+  _STT_INSTALL=() _STT_KNOW=() _STT_CFG=() _STT_REST=() _STT_HOOKS=() _STT_INSTR=()
+  _STT_INSTR_OWN=()
+  _STT_AGENT="" _STT_CURRENT="" _STT_UNSEEN="" _STT_MODE="" _STT_CURRENT_FW="" _STT_INIT=""
+  while IFS= read -r l || [ -n "$l" ]; do
+    # A line indented by two spaces belongs to the list named above it
+    # (modified:, missing:), which belongs to the drift line before that.
+    case "$l" in
+      "  "*)
+        if [ -n "$list" ]; then
+          _status_need_detail "$list" "${l#  }"
+          continue
+        fi
+        ;;
+    esac
+    list=""
+    # A hint is a detail of the line it follows; the newer-release hint is
+    # an item of its own, since nothing above it asked for it.
+    case "$l" in
+      "hint: jig v"*" is out; "*)
+        t=${l#hint: }
+        _status_need warn "${t%%; *}"
+        _status_need_detail hint "${t#*; }"
+        prev_need=""
+        continue
+        ;;
+      "hint: "*)
+        if [ -n "$prev_need" ]; then
+          _status_need_detail hint "${l#hint: }"
+        else
+          _status_need warn "${l#hint: }"
+        fi
+        prev_need=""
+        continue
+        ;;
+    esac
+    prev_need=""
+    case "$l" in
+      "jig "*) [ -n "$version" ] || version=${l#jig } ;;
+      "initialised: yes") _STT_INIT=1 ;;
+      "initialised: "*) _status_need warn "$l"; prev_need=1 ;;
+      "config.local: "*" is not ignored by git"*" (fix: "*")")
+        t=${l##* (fix: }
+        _status_need warn "${l% (fix: *}"
+        _status_need_detail fix "${t%)}"
+        ;;
+      "config.local: ignored "* | "config.local: "*" is ignored (set it in "*)
+        _status_need warn "$l"
+        ;;
+      "config.local: "*) _STT_CFG+=("${l#config.local: }") ;;
+      "notify: "*) _status_need warn "$l" ;;
+      "agent.git: invalid value "*) _status_need fail "$l" ;;
+      "agent.git: "*) _STT_AGENT=${l#agent.git: } ;;
+      "autopilot.git: invalid value "*) _status_need fail "$l" ;;
+      "autopilot.git: "*) _STT_AUTOPILOT=${l#autopilot.git: } ;;
+      "manifest: version="*)
+        t=${l#manifest: version=}
+        v=${t%% mode=*}
+        m=${t#* mode=}
+        _STT_MODE=${m%% source=*}
+        ;;
+      "manifest: "*) _status_need warn "$l" ;;
+      "framework versions: "*" current")
+        _STT_CURRENT_FW=1
+        t=${l#*project=}
+        _STT_INSTALL+=("framework"$'\t'"${t%% *} (project = global, current)")
+        ;;
+      "framework versions: "*"=unavailable")
+        t=${l#*project=}
+        _STT_INSTALL+=("framework"$'\t'"${t%% *} (global jig unavailable)")
+        ;;
+      "framework versions: "*) _status_need warn "$l"; prev_need=1 ;;
+      "drift: 0 modified, 0 missing, 0 pending")
+        _STT_INSTALL+=("drift"$'\t'"$(out_join "0 modified" "0 missing" "0 pending")")
+        ;;
+      # Pending is left off the plain line when it cannot be told, and "could
+      # not check" is not "nothing pending".
+      "drift: 0 modified, 0 missing")
+        _STT_INSTALL+=("drift"$'\t'"$(out_join "0 modified" "0 missing" "pending unknown")")
+        ;;
+      "drift: "*) _status_need warn "$l" ;;
+      "modified:" | "missing:") list=${l%:} ;;
+      "proposals: none") _STT_KNOW+=("proposals"$'\t'"none"$'\t') ;;
+      "proposals: "* | "sources changed: "*) _status_need warn "$l" ;;
+      "specs: none") _STT_KNOW+=("specs"$'\t'"none"$'\t') ;;
+      "specs: "*" (jig spec list)")
+        t=${l#specs: }
+        _STT_KNOW+=("specs"$'\t'"${t% (jig spec list)}"$'\t'"jig spec list")
+        ;;
+      "epic: "*", branch missing") _status_need warn "$l" ;;
+      "epic: "*) _STT_KNOW+=("epic"$'\t'"${l#epic: }"$'\t') ;;
+      "task "*)
+        ntasks=$((ntasks + 1))
+        if _status_task_needs "$l"; then
+          _status_need warn "$l"
+        else
+          _STT_TASKS+=("${l#task }")
+        fi
+        ;;
+      "no active tasks") ;;
+      "("*" finished; jig task list --all)")
+        t=${l#(}
+        finished=${t%% *}
+        ;;
+      "current task: ambiguous"*) _status_need warn "$l" ;;
+      "current task: "*) _STT_CURRENT=${l#current task: } ;;
+      "working here: "*" (jig "*", "*" ago)")
+        t=${l#working here: }
+        v=${t%% (jig *}
+        t=${t##* (jig }
+        t=${t% ago)}
+        _STT_OTHERS+=("$v"$'\t'"${t%, *}"$'\t'"${t##*, }")
+        ;;
+      # A runtime that does not name its sessions is a boundary, not
+      # something to fix: every person in a terminal of their own has one.
+      "sessions: not observable (no active runtime names its sessions here)")
+        _STT_UNSEEN=1
+        ;;
+      "sessions: "*) _status_need warn "$l" ;;
+      "housekeeping: 0 days ago") hk="ran today" ;;
+      "housekeeping: never") hk="never ran" ;;
+      "housekeeping: "*) hk="ran ${l#housekeeping: }" ;;
+      "needs consolidation: "*" (see "*")" | "worktrees kept: "*" (see "*")" \
+        | "wrong base: "*" (see "*")")
+        t=${l##* (see }
+        _status_need warn "${l% (see *}"
+        _status_need_detail see "${t%)}"
+        ;;
+      "session hook ("*"): installed") _STT_HOOKS+=("${l%: installed}") ;;
+      "session hook ("*) _status_need warn "$l" ;;
+      "notify hook ("*"): connected") _STT_HOOKS+=("${l%: connected}") ;;
+      "notify hook ("*) _status_need warn "$l" ;;
+      "instructions ("*"): ok")
+        t=${l#instructions (}
+        _STT_INSTR+=("${t%%)*}")
+        ;;
+      # Text a person changed in their own section is theirs to keep, and an
+      # upgrade keeps it: nothing to do, as doctor says too.
+      "instructions ("*"): Jig section in AGENTS.md was changed here; upgrades keep your text")
+        t=${l#instructions (}
+        _STT_INSTR_OWN+=("${t%%)*}")
+        ;;
+      "instructions ("*) _status_need warn "$l" ;;
+      "") ;;
+      *) _STT_REST+=("$l") ;;
+    esac
+  done
+  _status_terminal_hooks
+  [ -z "$hk" ] || _STT_INSTALL+=("housekeeping"$'\t'"$hk")
+  _status_terminal_print "$version" "$ntasks" "$finished"
+}
+
+# _status_terminal_hooks — the install's "hooks" row: the session hooks that
+# are installed and the runtimes whose instructions carry Jig's section.
+_status_terminal_hooks() {
+  local -a parts=()
+  local t
+  if [ ${#_STT_HOOKS[@]} -gt 0 ]; then parts+=("${_STT_HOOKS[@]}"); fi
+  if [ ${#_STT_INSTR[@]} -gt 0 ]; then
+    t=$(printf '%s, ' "${_STT_INSTR[@]}")
+    parts+=("instructions (${t%, })")
+  fi
+  if [ ${#_STT_INSTR_OWN[@]} -gt 0 ]; then
+    t=$(printf '%s, ' "${_STT_INSTR_OWN[@]}")
+    parts+=("instructions changed here (${t%, })")
+  fi
+  [ ${#parts[@]} -gt 0 ] || return 0
+  _STT_INSTALL+=("hooks"$'\t'"$(out_join "${parts[@]}")")
+}
+
+# _status_terminal_print <version> <tasks> <finished> — print what
+# _status_terminal gathered: the heading, then a section each. A section with
+# nothing in it is left out; what needs the reader is said once, in its own
+# section, and not again in the section it belongs to.
+_status_terminal_print() {
+  local version="$1" ntasks="$2" finished="$3" level i n t head verdict vlevel=ok
+  n=${#_STT_NEED_TEXT[@]}
+
+  head="jig $version"
+  [ -z "$_STT_NAME" ] || head="$head$(out_join "" "$_STT_NAME")"
+  if [ -z "$_STT_INIT" ]; then
+    head="$head$(out_join "" "not initialised")"
+  else
+    [ -z "$_STT_MODE" ] || head="$head$(out_join "" "$_STT_MODE mode")"
+    [ -z "$_STT_CURRENT_FW" ] || head="$head$(out_join "" "up to date")"
+  fi
+  if [ "$n" = 0 ]; then
+    verdict="nothing needs you"
+  else
+    vlevel=warn
+    for level in "${_STT_NEED_LEVEL[@]}"; do
+      if [ "$level" = fail ]; then vlevel=fail; fi
+    done
+    if [ "$n" = 1 ]; then verdict="1 item needs you"; else verdict="$n items need you"; fi
+  fi
+  out_heading "$head" "$vlevel" "$verdict"
+
+  if [ "$n" -gt 0 ]; then
+    out_section "Needs you" "$n"
+    for level in fail warn; do
+      i=0
+      while [ "$i" -lt "$n" ]; do
+        if [ "${_STT_NEED_LEVEL[$i]}" = "$level" ]; then
+          printf '  '
+          out_status "$level" "${_STT_NEED_TEXT[$i]}"
+          while IFS= read -r t; do
+            [ -n "$t" ] || continue
+            printf '  '
+            out_detail "${t%%$'\t'*}" "${t#*$'\t'}"
+          done <<< "${_STT_NEED_DETAIL[$i]}"
+        fi
+        i=$((i + 1))
+      done
+    done
+  fi
+  # An uninitialised project's report stops before everything else.
+  [ -n "$_STT_INIT" ] || return 0
+
+  if [ ${#_STT_INSTALL[@]} -gt 0 ]; then
+    out_section "Install"
+    for t in "${_STT_INSTALL[@]}"; do
+      out_row ok 6 ok plain 14 "${t%%$'\t'*}" plain 0 "${t#*$'\t'}"
+    done
+  fi
+  _status_terminal_settings
+  _status_terminal_tasks "$ntasks" "$finished"
+  if [ ${#_STT_KNOW[@]} -gt 0 ]; then
+    out_section "Knowledge & specs"
+    local key rest
+    for t in "${_STT_KNOW[@]}"; do
+      key=${t%%$'\t'*}
+      rest=${t#*$'\t'}
+      out_row plain 12 "$key" plain 40 "${rest%%$'\t'*}" dim 0 "${rest#*$'\t'}"
+    done
+  fi
+  _status_terminal_activity
+  if [ ${#_STT_REST[@]} -gt 0 ]; then
+    out_section "Other"
+    for t in "${_STT_REST[@]}"; do out_row plain 0 "$t"; done
+  fi
+}
+
+# _status_terminal_settings — agent.git and the config.local keys in effect.
+# Keys that share their first segment (housekeeping.*, claude.*) are one row;
+# agent.git is the agent.git line, with the queue it leaves for the reader.
+_status_terminal_settings() {
+  local -a keys=() vals=() labels=() texts=()
+  local t k p i j n w=12 done_p=""
+  [ -n "$_STT_AGENT" ] || [ ${#_STT_CFG[@]} -gt 0 ] || return 0
+  if [ -n "$_STT_AGENT" ]; then
+    t=${_STT_AGENT#* (}
+    labels+=("agent.git")
+    texts+=("$(out_join "${_STT_AGENT%% (*}" "${t%)}")")
+  fi
+  if [ -n "$_STT_AUTOPILOT" ]; then
+    t=${_STT_AUTOPILOT#* (}
+    labels+=("autopilot.git")
+    texts+=("$(out_join "${_STT_AUTOPILOT%% (*}" "${t%)}")")
+  fi
+  if [ ${#_STT_CFG[@]} -gt 0 ]; then
+    for t in "${_STT_CFG[@]}"; do
+      [ "${t%%=*}" != agent.git ] || continue
+      [ "${t%%=*}" != autopilot.git ] || continue
+      keys+=("${t%%=*}")
+      vals+=("${t#*=}")
+    done
+  fi
+  i=0
+  while [ "$i" -lt ${#keys[@]} ]; do
+    k=${keys[$i]}
+    p=${k%%.*}
+    case " $done_p " in *" $p "*) i=$((i + 1)); continue ;; esac
+    j=0 n=0
+    while [ "$j" -lt ${#keys[@]} ]; do
+      if [ "${keys[$j]%%.*}" = "$p" ] && [ "${keys[$j]}" != "$p" ]; then n=$((n + 1)); fi
+      j=$((j + 1))
+    done
+    if [ "$n" -ge 2 ]; then
+      done_p="$done_p $p"
+      local -a sub=()
+      j=0
+      while [ "$j" -lt ${#keys[@]} ]; do
+        if [ "${keys[$j]%%.*}" = "$p" ] && [ "${keys[$j]}" != "$p" ]; then
+          sub+=("${keys[$j]#*.} ${vals[$j]}")
+        fi
+        j=$((j + 1))
+      done
+      labels+=("$p")
+      t=$(printf '%s\037' "${sub[@]}")
+      texts+=("${t%$'\037'}")
+    else
+      labels+=("$k")
+      texts+=("${vals[$i]}")
+    fi
+    i=$((i + 1))
+  done
+  # Nothing left when the one key is an agent.git the report refused: that
+  # is under "Needs you", and an empty section says nothing.
+  [ ${#labels[@]} -gt 0 ] || return 0
+  for k in "${labels[@]}"; do
+    [ $((${#k} + 3)) -le "$w" ] || w=$((${#k} + 3))
+  done
+  if [ ${#_STT_CFG[@]} -gt 0 ]; then out_section "Settings" "config.local"; else out_section "Settings"; fi
+  # A row of several keys that would run past the section's width goes on
+  # under itself, whole items to a line.
+  local room=$((OUT_WIDTH - 2 - w)) label line item
+  local -a items=()
+  i=0
+  while [ "$i" -lt ${#labels[@]} ]; do
+    label=${labels[$i]} line="" items=()
+    IFS=$'\037' read -r -a items <<< "${texts[$i]}"
+    for item in "${items[@]}"; do
+      if [ -n "$line" ] && [ $((${#line} + ${#OUT_SEP} + ${#item})) -gt "$room" ]; then
+        out_row plain "$w" "$label" plain 0 "$line"
+        label="" line=""
+      fi
+      if [ -n "$line" ]; then line="$line$OUT_SEP$item"; else line=$item; fi
+    done
+    out_row plain "$w" "$label" plain 0 "$line"
+    i=$((i + 1))
+  done
+}
+
+# --- tasks grouped by the spec they belong to ------------------------------------
+#
+# A task belongs to the spec its task.md links to (jig_spec_link, the reading
+# `task start` and every spec command use). A spec whose roadmap declares an
+# epic (jig_spec_epic) is that epic's group; any other spec is a group of its
+# own; a task that links to no spec here, or to two, is under "Other tasks".
+# Epics come first, then specs, each in `spec list`'s order. The grouping is
+# drawn by the terminal form and the page only: the plain report a pipe reads
+# keeps its `task ...` lines as they were.
+
+_STG_IDS=()      # the task ids asked about
+_STG_SIDS=()     # the spec each belongs to, empty for none
+_STG_KEYS=()     # the groups that have tasks, in order: spec ids
+_STG_TITLE=()    # each group's title: the spec's first heading, or its id
+_STG_KIND=()     # epic | spec
+_STG_DONE=()     # roadmap items done, empty when the roadmap was not read
+_STG_TOTAL=()    # roadmap items in all, empty likewise
+_STG_SID=""      # _status_group_of's answer
+
+# _status_task_groups <id>... — fill the _STG_* globals for these task ids.
+# _STG_KEYS stays empty when none of them belongs to a spec. Progress is
+# spec_phase_rows summed — the counts `jig spec list` and the page's phases
+# show, read from the epic's branch when progress is made there (ADR-0040).
+_status_task_groups() {
+  local id sid root ws file used=" " sums s d t kind title pass
+  _STG_IDS=() _STG_SIDS=() _STG_KEYS=() _STG_TITLE=() _STG_KIND=() _STG_DONE=() _STG_TOTAL=()
+  root=$(spec_dir)
+  ws="$JIG_PROJECT/$JIG_AI_DIR/workspace/tasks"
+  for id in "$@"; do
+    sid=""
+    file="$ws/$id/task.md"
+    if [ -f "$file" ]; then sid=$(jig_spec_link "$file" 2>/dev/null) || sid=""; fi
+    if [ -n "$sid" ] && [ ! -d "$root/$sid" ]; then sid=""; fi
+    _STG_IDS+=("$id")
+    _STG_SIDS+=("$sid")
+    [ -z "$sid" ] || used="$used$sid "
+  done
+  [ "$used" != " " ] || return 0
+  [ -n "$_STATUS_PHASE_READY" ] || _status_phase_rows_collect
+  sums=$(printf '%s\n' "$_STATUS_PHASE_ROWS" | awk -F '\t' '
+    NF >= 5 { if (!($1 in d)) o[++n] = $1; d[$1] += $4; t[$1] += $5 }
+    END { for (i = 1; i <= n; i++) printf "%s\t%d\t%d\n", o[i], d[o[i]], t[o[i]] }')
+  for pass in epic spec; do
+    while IFS= read -r sid; do
+      [ -n "$sid" ] || continue
+      case "$used" in *" $sid "*) ;; *) continue ;; esac
+      kind=spec
+      if [ -f "$root/$sid/roadmap.md" ] \
+         && [ -n "$(jig_spec_epic "$root/$sid/roadmap.md" 2>/dev/null || true)" ]; then
+        kind=epic
+      fi
+      [ "$kind" = "$pass" ] || continue
+      title=""
+      [ ! -f "$root/$sid/spec.md" ] || title=$(spec_title "$root/$sid/spec.md")
+      d="" t=""
+      while IFS=$'\t' read -r s id; do
+        if [ "$s" = "$sid" ]; then d=${id%%$'\t'*} t=${id#*$'\t'}; fi
+      done <<SUMS
+$sums
+SUMS
+      _STG_KEYS+=("$sid")
+      _STG_TITLE+=("${title:-$sid}")
+      _STG_KIND+=("$kind")
+      _STG_DONE+=("$d")
+      _STG_TOTAL+=("$t")
+    done < <(spec_ids)
+  done
+}
+
+# spec_phase_rows, asked once per report: the page shows it twice, in "Running
+# now" and under Specifications, and each call reads every open epic's roadmap
+# from its branch.
+_STATUS_PHASE_ROWS=""
+_STATUS_PHASE_READY=""
+_status_phase_rows_collect() {
+  _STATUS_PHASE_ROWS=$(spec_phase_rows)
+  _STATUS_PHASE_READY=1
+}
+
+# _status_group_of <task-id> — the spec the task belongs to, into _STG_SID;
+# empty for "Other tasks".
+_status_group_of() {
+  local i=0
+  _STG_SID=""
+  while [ "$i" -lt ${#_STG_IDS[@]} ]; do
+    if [ "${_STG_IDS[$i]}" = "$1" ]; then _STG_SID=${_STG_SIDS[$i]}; return 0; fi
+    i=$((i + 1))
+  done
+}
+
+# _status_group_label <index> — "epic · 3/5 done" for the group at <index>
+# of _STG_KEYS, without the count when the roadmap was not read; into
+# _STG_LABEL.
+_STG_LABEL=""
+_status_group_label() {
+  _STG_LABEL=${_STG_KIND[$1]}
+  if [ -n "${_STG_TOTAL[$1]}" ]; then
+    _STG_LABEL="$_STG_LABEL$OUT_SEP${_STG_DONE[$1]}/${_STG_TOTAL[$1]} done"
+  fi
+}
+
+# _status_terminal_tasks <tasks> <finished> — one row per task that needs
+# nothing (a task that does is under "Needs you"): its class, its id, and
+# what differs from a task on its branch here — its own worktree and the files
+# waiting there, a base of its own, a lighter route, a running autopilot.
+# When any of them belongs to a spec, the rows are grouped
+# (_status_task_groups): a line per epic or spec with its progress, its tasks
+# under it on the branches of a tree, and "Other tasks" last.
+_status_terminal_tasks() {
+  local ntasks="$1" finished="$2" t id rest words w class wd counts
+  local -a ids=() classes=() notes=() note=()
+  if [ "$ntasks" -gt 0 ]; then counts="$ntasks active"; else counts="no active tasks"; fi
+  [ -z "$finished" ] || counts=$(out_join "$counts" "$finished finished")
+  if [ ${#_STT_TASKS[@]} -gt 0 ]; then
+    for t in "${_STT_TASKS[@]}"; do
+      id=${t%% *}
+      rest=${t#* }
+      # The worktree's path is the one field a person chose: cut it out
+      # before the rest is split into words.
+      case "$rest" in
+        *" worktree="*" uncommitted="*)
+          words="${rest%% worktree=*} worktree uncommitted=${rest##* uncommitted=}"
+          ;;
+        *) words=$rest ;;
+      esac
+      class=""
+      note=()
+      for wd in $words; do
+        case "$wd" in
+          class=*) class=${wd#class=} ;;
+          status=active) ;;
+          status=*) note+=("${wd#status=}") ;;
+          depth=*) note+=("${wd#depth=}") ;;
+          worktree) note+=("worktree") ;;
+          uncommitted=0) ;;
+          uncommitted=*) note+=("${wd#uncommitted=} uncommitted") ;;
+          base=*) note+=("base ${wd#base=}") ;;
+          autopilot=on) note+=("autopilot on") ;;
+          *) note+=("$wd") ;;
+        esac
+      done
+      ids+=("$id")
+      classes+=("${class:--}")
+      t=""
+      if [ ${#note[@]} -gt 0 ]; then
+        for wd in "${note[@]}"; do
+          if [ -n "$t" ]; then t="$t$OUT_SEP$wd"; else t=$wd; fi
+        done
+      fi
+      notes+=("$t")
+    done
+  fi
+  [ "$ntasks" -gt 0 ] || [ -n "$finished" ] || [ -n "$_STT_CURRENT" ] || return 0
+  out_section "Tasks" "$counts"
+  w=20
+  for id in "${ids[@]+"${ids[@]}"}"; do
+    [ $((${#id} + 3)) -le "$w" ] || w=$((${#id} + 3))
+  done
+  _STG_KEYS=()
+  if [ ${#ids[@]} -gt 0 ]; then _status_task_groups "${ids[@]}"; fi
+  local i=0 g key title text last
+  local -a members=()
+  if [ ${#_STG_KEYS[@]} -eq 0 ]; then
+    while [ "$i" -lt ${#ids[@]} ]; do
+      _status_terminal_task_row "" "${classes[$i]}" "$w" "${ids[$i]}" "${notes[$i]}"
+      i=$((i + 1))
+    done
+  fi
+  # One pass per group, and one more for "Other tasks".
+  g=0
+  while [ ${#_STG_KEYS[@]} -gt 0 ] && [ "$g" -le ${#_STG_KEYS[@]} ]; do
+    if [ "$g" -lt ${#_STG_KEYS[@]} ]; then
+      key=${_STG_KEYS[$g]}
+      title=${_STG_TITLE[$g]}
+      _status_group_label "$g"
+      text="($_STG_LABEL)"
+    else
+      key="" title="Other tasks" text=""
+    fi
+    g=$((g + 1))
+    members=()
+    i=0
+    while [ "$i" -lt ${#ids[@]} ]; do
+      _status_group_of "${ids[$i]}"
+      if [ "$_STG_SID" = "$key" ]; then members+=("$i"); fi
+      i=$((i + 1))
+    done
+    [ ${#members[@]} -gt 0 ] || continue
+    out_row bold $((${#title} + 2)) "$title" dim 0 "$text"
+    last=${members[$((${#members[@]} - 1))]}
+    for i in "${members[@]}"; do
+      if [ "$i" = "$last" ]; then t=$OUT_TREE_LAST; else t=$OUT_TREE; fi
+      _status_terminal_task_row "$t" "${classes[$i]}" "$w" "${ids[$i]}" "${notes[$i]}"
+    done
+  done
+  [ -z "$_STT_CURRENT" ] || out_row dim 4 "$OUT_MARK" plain 0 "current task: $_STT_CURRENT"
+}
+
+# _status_terminal_task_row <branch> <class> <width> <id> <notes> — one task's
+# row, on <branch> of a group's tree, or flat when <branch> is empty.
+_status_terminal_task_row() {
+  local cstyle
+  case "$2" in
+    T3 | T4) cstyle=warn ;;
+    T0 | T1) cstyle=dim ;;
+    *) cstyle=plain ;;
+  esac
+  if [ -n "$1" ]; then
+    out_row dim 3 "$1" "$cstyle" 4 "$2" bold "$3" "$4" warn 0 "$5"
+  else
+    out_row "$cstyle" 4 "$2" bold "$3" "$4" warn 0 "$5"
+  fi
+}
+
+# _status_terminal_activity — what was recorded in this checkout lately
+# (checkout.sh), folded: the latest record on a row of its own, then one row
+# per command and hour, the records of each counted and their first ids
+# named. The last row says who holds HEAD here, the same rule a refusal uses
+# (jig_checkout_occupants).
+_status_terminal_activity() {
+  local t n=0 oldest="" age subject cmd ids cw=12 hold
+  local -a ages=() subjects=() cmds=() idlists=()
+  if [ ${#_STT_OTHERS[@]} -gt 0 ]; then
+    n=${#_STT_OTHERS[@]}
+    while IFS=$'\t' read -r age subject cmd ids; do
+      [ -n "$age" ] || continue
+      if [ "$age" = "@oldest" ]; then oldest=$subject; continue; fi
+      ages+=("$age")
+      subjects+=("$subject")
+      cmds+=("$cmd")
+      idlists+=("$ids")
+    done < <(printf '%s\n' "${_STT_OTHERS[@]}" | _status_activity_fold)
+  fi
+  if [ "$n" = 0 ]; then
+    out_section "Recent activity here" "no records"
+  elif [ "$n" = 1 ]; then
+    out_section "Recent activity here" "1 record, $oldest ago"
+  else
+    out_section "Recent activity here" "$n records, last $oldest"
+  fi
+  # The command first, so that what it was run on has the rest of the
+  # line: a group names as many of its ids as fit there.
+  local i=0 room
+  while [ "$i" -lt ${#ages[@]} ]; do
+    [ $((${#cmds[$i]} + 3)) -le "$cw" ] || cw=$((${#cmds[$i]} + 3))
+    i=$((i + 1))
+  done
+  [ "$cw" -le 30 ] || cw=30
+  room=$((OUT_WIDTH - 2 - 6 - cw))
+  i=0
+  while [ "$i" -lt ${#ages[@]} ]; do
+    subject=${subjects[$i]}
+    case "$subject" in
+      [0-9]*" "*)
+        t=plain
+        if [ -n "${idlists[$i]}" ]; then
+          _status_fit_ids $((room - ${#subject} - 2)) "${idlists[$i]}"
+          subject="$subject: $_STT_FIT"
+        fi
+        ;;
+      *) t=bold ;;
+    esac
+    out_row dim 6 "${ages[$i]}" plain "$cw" "${cmds[$i]}" "$t" 0 "$subject"
+    i=$((i + 1))
+  done
+  # Only the task is named: the record's command may be this very report,
+  # which refreshed it a moment ago.
+  if [ -n "$_STT_HEAD" ]; then
+    hold="task ${_STT_HEAD%% *} holds HEAD here"
+  else
+    hold="nothing here holds HEAD"
+  fi
+  [ -z "$_STT_UNSEEN" ] || hold=$(out_join "$hold" "sessions not observable")
+  out_row dim 6 "$OUT_MARK" plain 0 "$hold"
+}
+
+# _status_fit_ids <width> <ids> — as many of the comma-separated <ids> as fit
+# in <width> characters, whole, followed by "more" when any is left out; into
+# _STT_FIT. When not even the first fits, "more" alone.
+_STT_FIT=""
+_status_fit_ids() {
+  local room="$1" list="$2" more="$OUT_MORE" cut=0 id t need
+  case "$list" in *", $more") list=${list%, "$more"}; cut=1 ;; esac
+  _STT_FIT=""
+  while [ -n "$list" ]; do
+    id=${list%%, *}
+    if [ "$id" = "$list" ]; then list=""; else list=${list#*, }; fi
+    if [ -n "$_STT_FIT" ]; then t="$_STT_FIT, $id"; else t=$id; fi
+    need=${#t}
+    # Whatever is still left needs room for the "more" that says so.
+    if [ -n "$list" ] || [ "$cut" = 1 ]; then need=$((need + 2 + ${#more})); fi
+    if [ "$need" -gt "$room" ]; then
+      if [ -n "$_STT_FIT" ]; then _STT_FIT="$_STT_FIT, $more"; else _STT_FIT=$more; fi
+      return 0
+    fi
+    _STT_FIT=$t
+  done
+  if [ "$cut" = 1 ]; then _STT_FIT="$_STT_FIT, $more"; fi
+  return 0
+}
+
+# _status_activity_fold — "label<TAB>command<TAB>age" lines on stdin (age as
+# jig_checkout_ago prints it), folded into rows "age<TAB>subject<TAB>command<TAB>ids",
+# youngest first, then one "@oldest<TAB><age>" line. The latest record is a
+# row of its own; the rest are grouped by command and by the hour of their
+# age, a group's age being its youngest record's. A group of one names its
+# record; a larger one counts them ("6 tasks") and names up to three ids,
+# then "more".
+_status_activity_fold() {
+  awk -F '\t' '
+    {
+      a = $3; s = a + 0
+      if (a ~ /m$/) s *= 60; else if (a ~ /h$/) s *= 3600
+      printf "%010d\t%s\t%s\t%s\n", s, a, $1, $2
+    }' | sort | MORE="$OUT_MORE" awk -F '\t' '
+    function name(l) { sub(/^task /, "", l); return l }
+    {
+      s = $1 + 0; oldest = $2
+      if (NR == 1) { first = $2 "\t" name($3) "\t" $4 "\t"; next }
+      k = int(s / 3600) "\t" $4
+      if (!(k in c)) { order[++m] = k; age[k] = $2; cmd[k] = $4 }
+      c[k]++
+      if ($3 ~ /^task /) { t[k]++; if (t[k] <= 3) ids[k] = ids[k] (t[k] > 1 ? ", " : "") name($3); else more_[k] = 1 }
+      else o[k]++
+      one[k] = name($3)
+    }
+    END {
+      if (NR == 0) exit
+      print first
+      for (j = 1; j <= m; j++) {
+        k = order[j]
+        if (c[k] == 1) { print age[k] "\t" one[k] "\t" cmd[k] "\t"; continue }
+        if (!o[k]) subj = c[k] " tasks"; else if (!t[k]) subj = c[k] " sessions"; else subj = c[k] " records"
+        l = ids[k]; if (more_[k]) l = l ", " ENVIRON["MORE"]
+        print age[k] "\t" subj "\t" cmd[k] "\t" l
+      }
+      print "@oldest\t" oldest
+    }'
 }
 
 # The live tasks, read once per report and shared by the text report and the
@@ -337,7 +1161,7 @@ _STATUS_US=$(printf '\037')
 # sed per key per task: the page is redrawn after every task command, and a
 # process per value made ten tasks cost seconds. One line per state file,
 # <task_id> <class> <status> <paused> <paused_reason> <branch> <base_branch>
-# <autopilot> <pr_url> <knowledge_consolidated>, joined by \037; each value is
+# <autopilot> <pr_url> <knowledge_consolidated> <route_depth> <class_lowered_from> <issue>, joined by \037; each value is
 # what `sed -n 's/^<key>:[[:space:]]*//p' | head -n 1` gave, the first match.
 _status_task_rows() {
   local f
@@ -349,9 +1173,10 @@ _status_task_rows() {
   awk '
     function out() {
       if (have)
-        printf "%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\n",
+        printf "%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\n",
           v["task_id"], v["class"], v["status"], v["paused"], v["paused_reason"],
-          v["branch"], v["base_branch"], v["autopilot"], v["pr_url"], v["knowledge_consolidated"]
+          v["branch"], v["base_branch"], v["autopilot"], v["pr_url"], v["knowledge_consolidated"],
+          v["route_depth"], v["class_lowered_from"], v["issue"]
     }
     FNR == 1 { out(); split("", v); split("", seen); have = 1 }
     /^[^:]+:/ {
@@ -366,19 +1191,22 @@ _status_task_rows() {
 # _status_live_collect [page] — fill _STATUS_LIVE, _STATUS_FINISHED and
 # _STATUS_WORKTREES. Per live task it asks the peers once: where its branch is
 # checked out (git's own list, ADR-0029) and how many files wait there, and
-# the receipt line `jig task receipt --check` prints (task_receipt_check). With
+# the receipt line `jig task receipt --check` prints (task_receipt_check, asked
+# `cheap`: no `jig context` process per task, so "not checked", not "current",
+# when the diff has not moved). With
 # `page`, also the answers only the page shows: the gate of a T3/T4 design
 # (_task_gate_state) and the autopilot run (_task_autopilot_facts).
 _status_live_collect() {
-  local page="${1:-}" row id class status paused reason branch base autopilot pr_url kc
-  local wt wt_note receipt gate facts us="$_STATUS_US"
+  local page="${1:-}" row id class status paused reason branch base autopilot pr_url kc own_depth lowered issue
+  local wt wt_note receipt gate facts depth setting us="$_STATUS_US"
   _STATUS_FINISHED=0
   _STATUS_LIVE=""
   _STATUS_WORKTREES=$(_task_worktrees)
   _STATUS_DEFAULT_BASE=$(cfg git.base_branch main)
+  setting=$(_task_route_setting)
   while IFS= read -r row; do
     [ -n "$row" ] || continue
-    IFS="$us" read -r id class status paused reason branch base autopilot pr_url kc <<EOF
+    IFS="$us" read -r id class status paused reason branch base autopilot pr_url kc own_depth lowered issue <<EOF
 $row
 EOF
     case "$status" in
@@ -393,7 +1221,7 @@ EOF
     fi
     # task_receipt_check exits 1 for stale and for a T4 with none; its line
     # is the answer either way.
-    receipt=$(task_receipt_check "$id" || true)
+    receipt=$(task_receipt_check "$id" cheap || true)
     gate="" facts=""
     if [ "$page" = page ]; then
       case "$class" in
@@ -401,7 +1229,12 @@ EOF
       esac
       [ -z "$autopilot" ] || facts=$(_task_autopilot_facts "$id")
     fi
-    _STATUS_LIVE="$_STATUS_LIVE$id$us$class$us$status$us$paused$us$reason$us$branch$us$base$us$autopilot$us$pr_url$us$kc$us$wt$us$wt_note$us$receipt$us$gate$us$facts
+    # The task's route depth, as task.sh's rule answers it
+    # (_task_route_depth_of) for the key the state row already holds and the
+    # person's route.depth, read once above.
+    depth=$(_task_route_depth_of "$own_depth" "$setting")
+    depth=${depth%%$'\t'*}
+    _STATUS_LIVE="$_STATUS_LIVE$id$us$class$us$status$us$paused$us$reason$us$branch$us$base$us$autopilot$us$pr_url$us$kc$us$wt$us$wt_note$us$receipt$us$gate$us$depth$us$lowered$us$issue$us$facts
 "
   done <<EOF
 $(_status_task_rows)
@@ -410,10 +1243,15 @@ EOF
 }
 
 # _status_rec <record> — one _STATUS_LIVE record into the _ST_* globals.
-# _ST_APFACTS is _task_autopilot_facts' line, tab-separated, or empty.
+# _ST_APFACTS is _task_autopilot_facts' line, tab-separated, or empty; it is
+# the last field because it is the one holding tabs. _ST_DEPTH is the task's
+# route depth (_task_route_depth): `full` or `lean`. _ST_LOWERED is the class
+# the task was lowered from (`class_lowered_from`), empty when it never was.
+# _ST_ISSUE is the task's tracker issue (`issue`), empty when it has none.
 _status_rec() {
   IFS="$_STATUS_US" read -r _ST_ID _ST_CLASS _ST_STATUS _ST_PAUSED _ST_REASON _ST_BRANCH _ST_BASE \
-    _ST_AUTOPILOT _ST_PR_URL _ST_KC _ST_WT _ST_WT_NOTE _ST_RECEIPT _ST_GATE _ST_APFACTS <<EOF
+    _ST_AUTOPILOT _ST_PR_URL _ST_KC _ST_WT _ST_WT_NOTE _ST_RECEIPT _ST_GATE _ST_DEPTH _ST_LOWERED _ST_ISSUE \
+    _ST_APFACTS <<EOF
 $1
 EOF
 }
@@ -426,6 +1264,7 @@ EOF
 _status_current_task() {
   local current cur_rc=0 cur_err_file ids
   cur_err_file=$(mktemp "${TMPDIR:-/tmp}/jig-status-current.XXXXXX")
+  jig_cleanup_add "$cur_err_file"
   current=$(task_current 2>"$cur_err_file") || cur_rc=$?
   case "$cur_rc" in
     0)
@@ -487,11 +1326,11 @@ _status_housekeeping_age() {
 # keeps that exit code around, and a flag nobody sees is the manual discipline
 # the framework exists to remove (RULES.md, Scope invariants).
 #
-# Counted from _status_flagged_ids, so this line and the page's cards name the
+# Counted from hklog_flagged_ids, so this line and the page's cards name the
 # same tasks: a count that said two while the cards showed one would send the
 # reader looking for a task that is not there.
 _status_hk_count() {
-  _status_flagged_ids "$1" | grep -c . || true
+  hklog_flagged_ids "$1" | grep -c . || true
 }
 
 # --- the status page (`jig status --html | --open`) ------------------------------
@@ -574,7 +1413,7 @@ _status_html() {
   out="$dir/status.html"
   mkdir -p "$dir" || jig_die "status --html: cannot create $dir"
   _STATUS_HTML_TMP="$out.tmp.$$"
-  trap 'if [ -n "${_STATUS_HTML_TMP:-}" ]; then rm -f "$_STATUS_HTML_TMP"; fi' EXIT INT TERM
+  jig_cleanup_add "$_STATUS_HTML_TMP"
   _status_html_page > "$_STATUS_HTML_TMP"
   mv "$_STATUS_HTML_TMP" "$out" || jig_die "status --html: cannot write $out"
   _STATUS_HTML_TMP=""
@@ -698,49 +1537,6 @@ _status_ago() {
   fi
 }
 
-# _status_hk_ids <regex> — the tasks whose line in the last housekeeping run
-# matches <regex>, distinct and in log order; nothing when housekeeping has
-# never logged. The one reader of the log's task lines here; what the log said
-# is where a flag starts, not where it ends -- _status_flagged_ids asks this
-# disk whether the flag still stands.
-_status_hk_ids() {
-  local hk_log="$JIG_PROJECT/$JIG_AI_DIR/runtime/housekeeping.log"
-  [ -f "$hk_log" ] || return 0
-  _status_hk_ids_in "$hk_log" "$1"
-}
-
-_status_hk_ids_in() {
-  JIG_HK_RE="$2" awk '
-    # split("", seen) clears the array portably; `delete seen` is an
-    # extension not every awk on a supported machine has.
-    /^--- run / { split("", seen); n = 0; next }
-    $0 ~ ENVIRON["JIG_HK_RE"] {
-      for (i = 1; i <= NF; i++) {
-        if ($i ~ /^task=/) {
-          id = substr($i, 6)
-          if (!(id in seen)) { seen[id] = 1; ids[++n] = id }
-        }
-      }
-    }
-    END { for (i = 1; i <= n; i++) print ids[i] }
-  ' "$1"
-}
-
-# _status_hk_run — "<UTC time>\t<forge>" of the last housekeeping run, from its
-# `--- run` marker; <forge> is github|gitlab|none|failed, `-` when the marker
-# predates the field. Nothing when housekeeping has never logged a run.
-_status_hk_run() {
-  local hk_log="$JIG_PROJECT/$JIG_AI_DIR/runtime/housekeeping.log"
-  [ -f "$hk_log" ] || return 0
-  awk '
-    /^--- run / {
-      at = $3; forge = "-"
-      for (i = 4; i <= NF; i++) if ($i ~ /^forge=/) forge = substr($i, 7)
-    }
-    END { if (at != "") printf "%s\t%s\n", at, forge }
-  ' "$hk_log"
-}
-
 # _status_hk_stale <UTC time> <forge> — exit 0 when the pull request states of
 # that run cannot be trusted as current: the forge did not answer, or the run
 # is older than `housekeeping.cadence`, after which the session hook would
@@ -755,6 +1551,17 @@ _status_hk_stale() {
   [ -n "$past" ] || return 0
   now=$(date -u +%s)
   [ $((now - past)) -gt $((days * 86400)) ]
+}
+
+# _status_hk_load — the last housekeeping run, into _STATUS_HK_AT (UTC),
+# _STATUS_HK_FORGE and _STATUS_HK_WHEN (the reader's zone); all empty when it
+# never ran. Read once, for the page and for `jig status --json` alike.
+_status_hk_load() {
+  _STATUS_HK_RUN=$(hklog_last_run)
+  _STATUS_HK_AT=$(printf '%s\n' "$_STATUS_HK_RUN" | cut -f 1)
+  _STATUS_HK_FORGE=$(printf '%s\n' "$_STATUS_HK_RUN" | cut -f 2)
+  _STATUS_HK_WHEN=""
+  [ -z "$_STATUS_HK_AT" ] || _STATUS_HK_WHEN=$(_status_when "$_STATUS_HK_AT")
 }
 
 # _status_in <id> <list> — exit 0 when <id> is a line of <list>.
@@ -775,11 +1582,7 @@ _status_html_page() {
   _status_live_collect page
   report=$(set -e; _status_report)
 
-  _STATUS_HK_RUN=$(_status_hk_run)
-  _STATUS_HK_AT=$(printf '%s\n' "$_STATUS_HK_RUN" | cut -f 1)
-  _STATUS_HK_FORGE=$(printf '%s\n' "$_STATUS_HK_RUN" | cut -f 2)
-  _STATUS_HK_WHEN=""
-  [ -z "$_STATUS_HK_AT" ] || _STATUS_HK_WHEN=$(_status_when "$_STATUS_HK_AT")
+  _status_hk_load
 
   cat <<'HTML'
 <!DOCTYPE html>
@@ -1005,18 +1808,83 @@ _status_card() {
   printf '<p class="todo">%s</p></div>\n' "$(_status_h "$4")"
 }
 
-# _status_html_needs — what only the reader can do, most urgent first: a
-# stopped autopilot run, a design at its gate, a finished task waiting for its
-# git step, a pull request to review or merge, a merged task to close, work
-# that landed wrong or was left in a worktree, knowledge to decide. Each card
-# says in plain words what to do. Nothing to do is said out loud too.
+# _status_html_needs — the "Needs you" section: one card per attention item
+# (_status_attention), in its order. Nothing to do is said out loud too.
+# `jig status --json` reports the same items (_status_json), so the page and
+# the data cannot disagree about what needs the reader.
 _status_html_needs() {
-  local cards="" stopped="" gates="" git_steps="" rec id stop_reason stop_at ago level queue url live hk_note pr_ids=""
+  local attn rec kind stype sid tasks title detail todo url label badge
+  attn=$(_status_attention)
+  printf '<section id="needs">\n<h2>Needs you</h2>\n'
+  if [ -n "$attn" ]; then
+    printf '<div class="cards">\n'
+    while IFS= read -r rec; do
+      [ -n "$rec" ] || continue
+      # shellcheck disable=SC2034 # tasks is the JSON's field; a card names its subject
+      IFS="$_STATUS_US" read -r kind stype sid tasks title detail todo url <<REC
+$rec
+REC
+      case "$stype" in
+        phase) label="phase $sid" ;;
+        *) label=$sid ;;
+      esac
+      badge=""
+      case "$kind" in
+        autopilot-stopped | phase-stopped) badge='<span class="badge warn">autopilot stopped</span>' ;;
+      esac
+      _status_card "$title" "$label" "$detail" "$todo" "$url" "$badge"
+    done <<ATTN
+$attn
+ATTN
+    printf '</div>\n'
+  else
+    printf '<p class="nothing">Nothing needs you right now.</p>\n'
+    if [ -n "$_STATUS_HK_AT" ] && _status_hk_stale "$_STATUS_HK_AT" "$_STATUS_HK_FORGE"; then
+      printf '<p class="muted">Pull request data is stale, so a pull request waiting for you may be missing here.</p>\n'
+    fi
+  fi
+  printf '</section>\n'
+}
+
+# _status_attn <kind> <subject-type> <subject-id> <tasks> <title> <detail>
+# <todo> [url] — one attention item as a record: the fields joined by \037 on
+# one line. <kind> is the stable word a program reads (schemas/json.md);
+# <subject-type> is `task`, `phase` or `project` (whose <subject-id> is
+# empty); <tasks> the ids the item is about, space-separated.
+_status_attn() {
+  local us="$_STATUS_US"
+  printf '%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n' "$1" "$us" "$2" "$us" "$3" "$us" "$4" "$us" \
+    "$5" "$us" "$6" "$us" "$7" "$us" "${8:-}"
+}
+
+# _status_attention — what only the reader can do, one record (_status_attn)
+# per item, most urgent first: a new jig release, a stopped autopilot run, a
+# design at its gate, a finished task waiting for its git step, a pull request
+# to review or merge, a merged task to close, work that landed wrong or was
+# left in a worktree, knowledge to decide. Each says in plain words what to do.
+#
+# The one answer to "what needs the reader": the page renders it as cards and
+# `jig status --json` as items. It reads what the page reads — _STATUS_LIVE
+# (_status_live_collect page), the last housekeeping run (_status_hk_load) and
+# the counts (_SC_*) — and both print the same records, so nothing is computed
+# twice.
+_status_attention() {
+  local stopped="" gates="" git_steps="" rec id stop_reason stop_at ago level queue url live hk_note pr_ids=""
   local nc wrong kept closed open settled phase phase_stops=""
   hk_note=""
   [ -z "$_STATUS_HK_AT" ] || hk_note="housekeeping at $_STATUS_HK_WHEN"
   level=$(jig_agent_git 2>/dev/null) || level=none
-  settled=$(_status_hk_ids ' remote=(merged|closed) ')
+  settled=$(hklog_ids ' remote=(merged|closed) ')
+
+  # 0. A new jig release is out (task status-says-a-newer-jig-exists): the
+  # one item here that is about the framework itself rather than any task,
+  # so it leads, first of all — a person who never runs `jig doctor` learns
+  # of it only from this page and the plain-text hint (_status_new_release_hint).
+  local latest_release
+  if latest_release=$(_status_latest_release_available); then
+    _status_attn release-available project "" "" "jig v$latest_release is out" "" \
+      "jig self-update, then jig upgrade"
+  fi
 
   while IFS= read -r rec; do
     [ -n "$rec" ] || continue
@@ -1024,7 +1892,7 @@ _status_html_needs() {
     # A pull request jig opened, unless housekeeping already saw it settled.
     # Collected before anything below, because the branches that follow end
     # the iteration: a task whose autopilot stopped is exactly the one that
-    # has just been shipped, and its pull request was the card most likely to
+    # has just been shipped, and its pull request was the item most likely to
     # be missing.
     if [ -n "$_ST_PR_URL" ] && ! _status_in "$_ST_ID" "$settled"; then
       pr_ids="$pr_ids$_ST_ID
@@ -1039,10 +1907,10 @@ _status_html_needs() {
       fi
       # The reason was written once, when the run stopped, and nothing
       # rechecks it: it is prose, and the task moves on without it. So the
-      # card quotes it as what was said then -- the age leads, and the reason
+      # item quotes it as what was said then -- the age leads, and the reason
       # follows a colon -- instead of appending the age to a sentence that
-      # then reads as true now. What is true now the page derives itself, in
-      # the cards around this one.
+      # then reads as true now. What is true now is derived here, in the
+      # items around this one.
       ago=""
       [ -z "$stop_at" ] || [ "$stop_at" = "-" ] || ago=$(_status_ago "$stop_at")
       case "$ago" in
@@ -1054,7 +1922,7 @@ _status_html_needs() {
       # agent was started by a coordinator, which is where the question
       # surfaced and where the answer goes back
       # (adr-20260922-a-phase-run-is-coordinated). Every stop of one phase is
-      # held back here and becomes a single card below — the page says what
+      # held back here and becomes a single item below — the page says what
       # the coordinator says in chat, one message for the whole wave.
       phase=$(printf '%s\n' "$_ST_APFACTS" | cut -f 7)
       if [ -n "$phase" ] && [ "$phase" != "-" ]; then
@@ -1062,19 +1930,22 @@ _status_html_needs() {
 "
         continue
       fi
-      stopped="$stopped$(_status_card "Autopilot stopped and is waiting for you" "$_ST_ID" "$stop_reason" \
-        "Answer the agent in this task's session; it resumes the run." "" '<span class="badge warn">autopilot stopped</span>')
+      stopped="$stopped$(_status_attn autopilot-stopped task "$_ST_ID" "$_ST_ID" \
+        "Autopilot stopped and is waiting for you" "$stop_reason" \
+        "Answer the agent in this task's session; it resumes the run.")
 "
       continue
     fi
     # 2. A design waits at its human gate, or changed after it was approved.
     case "$_ST_GATE" in
       waiting)
-        gates="$gates$(_status_card "A design is waiting for your decision" "$_ST_ID" "design.md in the task's workspace" \
+        gates="$gates$(_status_attn gate-waiting task "$_ST_ID" "$_ST_ID" \
+          "A design is waiting for your decision" "design.md in the task's workspace" \
           "Read the design the agent showed you and approve it, or say what to change.")
 " ;;
       changed)
-        gates="$gates$(_status_card "A design changed after you approved it" "$_ST_ID" "design.md in the task's workspace" \
+        gates="$gates$(_status_attn gate-changed task "$_ST_ID" "$_ST_ID" \
+          "A design changed after you approved it" "design.md in the task's workspace" \
           "Read what changed and approve it again before the work goes on.")
 " ;;
     esac
@@ -1088,39 +1959,42 @@ _status_html_needs() {
         commit) queue="Push the task's branch: the agent may commit but not push in this clone." ;;
         push) queue="Open a pull request for the task's branch: the agent may push but not open one here." ;;
       esac
-      [ -z "$queue" ] || git_steps="$git_steps$(_status_card "Ready for your step in git" "$_ST_ID" "agent.git: $level" "$queue")
+      [ -z "$queue" ] || git_steps="$git_steps$(_status_attn git-step task "$_ST_ID" "$_ST_ID" \
+        "Ready for your step in git" "agent.git: $level" "$queue")
 "
     fi
-  done <<EOF
+  done <<LIVE
 $_STATUS_LIVE
-EOF
+LIVE
   # Most urgent first, whatever order the workspaces came in; a phase run's
-  # stops come first of all, as one card per phase.
-  cards="$(_status_phase_stop_cards "$phase_stops")$stopped$gates$git_steps"
+  # stops come first of all, as one item per phase — after only a new
+  # release, which is not about any task.
+  _status_attention_phase_stops "$phase_stops"
+  printf '%s' "$stopped$gates$git_steps"
 
   # 4. A pull request waits for review or merge: one jig opened (pr_url), or
   # one the last housekeeping run saw open (a closed task's too).
   #
-  # Deliberately outside _status_flagged_ids, and "a closed task's too" is the
+  # Deliberately outside hklog_flagged_ids, and "a closed task's too" is the
   # reason: closing a task does not merge its pull request, so a consolidated
-  # task with `remote=open` contradicts nothing and this card still asks for
+  # task with `remote=open` contradicts nothing and this item still asks for
   # something real. Only the forge can answer whether it is open, which is why
   # it is worded in the past tense and asks for a refresh first.
   #
   # One live answer does reach it, in the loop below: a task the person
-  # abandoned. That disproves no flag either -- it makes the card's ask wrong,
-  # so the card changes what it asks instead of disappearing.
-  open=$(_status_hk_ids ' remote=open ')
+  # abandoned. That disproves no flag either -- it makes the item's ask wrong,
+  # so the item changes what it asks instead of disappearing.
+  open=$(hklog_ids ' remote=open ')
   while IFS= read -r id; do
     [ -n "$id" ] || continue
     _status_in "$id" "$pr_ids" || pr_ids="$pr_ids$id
 "
-  done <<EOF
+  done <<OPEN
 $open
-EOF
+OPEN
   while IFS= read -r id; do
     [ -n "$id" ] || continue
-    # Guarded for the same reason as in _status_hk_recheck: these ids include
+    # Guarded for the same reason as in _hklog_recheck: these ids include
     # the log's, and a malformed one would take task_dir into jig_die, which
     # redraws the page being drawn.
     url="" live=""
@@ -1132,123 +2006,179 @@ EOF
       # `task abandon` never touches the forge, so a task the person gave up
       # on keeps its pull request. The flag stands -- only the forge knows
       # whether it is still open -- but the ask does not: work nobody wants is
-      # not work to merge. So this card keeps the borrowed fact and changes
+      # not work to merge. So this item keeps the borrowed fact and changes
       # what it asks for, which is the one thing the local answer is good for
       # here. `consolidated` is deliberately not treated this way: a closed
       # task with an open pull request is worth looking at, and merging it is
       # still the right move.
       #
-      # Borrowed exactly as much as the card below it, and worded the same
+      # Borrowed exactly as much as the item below it, and worded the same
       # way: past tense, and a refresh asked for first. Only what the task's
       # own state says -- that it was abandoned -- is present tense here. A
-      # change about cards claiming more than they know may not add one.
-      cards="$cards$(_status_card "A pull request was open for a task you abandoned" "$id" \
-        "${hk_note:+open as of $hk_note}" \
-        "It may have been closed or merged since: jig last asked the forge then. Run jig housekeeping to refresh, then close on the forge what is still open, or reopen the task. Nothing here will merge it." "$url")
-"
+      # change about items claiming more than they know may not add one.
+      _status_attn pull-request-of-abandoned-task task "$id" "$id" \
+        "A pull request was open for a task you abandoned" "${hk_note:+open as of $hk_note}" \
+        "It may have been closed or merged since: jig last asked the forge then. Run jig housekeeping to refresh, then close on the forge what is still open, or reopen the task. Nothing here will merge it." "$url"
     elif _status_in "$id" "$open"; then
       # Borrowed knowledge: housekeeping asks the forge once a cadence, so this
       # one may have been merged since. Past tense, and the first thing asked
       # for is a refresh -- the imperative below it is the one the reader acts
       # on, so it must not tell them to merge what may already be merged.
-      cards="$cards$(_status_card "A pull request was open at the last housekeeping run" "$id" "open as of $hk_note" \
-        "It may have been merged since: jig last asked the forge then. Run jig housekeeping to refresh, then review and merge what is still open." "$url")
-"
+      _status_attn pull-request-was-open task "$id" "$id" \
+        "A pull request was open at the last housekeeping run" "open as of $hk_note" \
+        "It may have been merged since: jig last asked the forge then. Run jig housekeeping to refresh, then review and merge what is still open." "$url"
     else
-      cards="$cards$(_status_card "A pull request is waiting for review or merge" "$id" "opened by jig task ship" \
-        "Review it and merge it; jig merges one itself only at agent.git: merge, on green CI." "$url")
-"
+      _status_attn pull-request-waiting task "$id" "$id" \
+        "A pull request is waiting for review or merge" "opened by jig task ship" \
+        "Review it and merge it; jig merges one itself only at agent.git: merge, on green CI." "$url"
     fi
-  done <<EOF
+  done <<PRS
 $pr_ids
-EOF
+PRS
 
   # 5. Merged and ready to close (needs-consolidation, ADR-0030). 6. Work that
   # landed elsewhere, a pull request closed unmerged, a worktree left behind:
   # kept, and only a person can say what happens next.
   #
-  # Through _status_flagged_ids, so a flag this disk already disproves -- a
-  # task closed since the run, a worktree removed since it -- builds no card,
+  # Through hklog_flagged_ids, so a flag this disk already disproves -- a
+  # task closed since the run, a worktree removed since it -- makes no item,
   # and the same four answers reach the counts.
-  nc=$(_status_flagged_ids needs-consolidation)
-  wrong=$(_status_flagged_ids wrong-base)
-  closed=$(_status_flagged_ids 'abandoned?')
-  kept=$(_status_flagged_ids worktree-kept)
-  cards="$cards$(_status_cards "$nc" "Merged: the task can be closed" "$hk_note" \
-    "Tell the agent to close this task (jig-consolidate).")"
-  cards="$cards$(_status_cards "$wrong" "The work landed on a different branch than planned" "$hk_note" \
-    "Check where its pull request was merged; the details are in .ai/runtime/housekeeping.log.")"
-  cards="$cards$(_status_cards "$closed" "The pull request was closed without merging" "$hk_note" \
-    "Reopen it, or tell the agent to abandon the task.")"
-  cards="$cards$(_status_cards "$kept" "A worktree was kept because it still holds work" "$hk_note" \
-    "Commit or discard what is left in the task's worktree; the next housekeeping removes it.")"
+  nc=$(hklog_flagged_ids needs-consolidation)
+  wrong=$(hklog_flagged_ids wrong-base)
+  closed=$(hklog_flagged_ids 'abandoned?')
+  kept=$(hklog_flagged_ids worktree-kept)
+  _status_attention_per_task needs-consolidation "$nc" "Merged: the task can be closed" "$hk_note" \
+    "Tell the agent to close this task (jig-consolidate)."
+  _status_attention_per_task wrong-base "$wrong" "The work landed on a different branch than planned" "$hk_note" \
+    "Check where its pull request was merged; the details are in .ai/runtime/housekeeping.log."
+  _status_attention_per_task closed-unmerged "$closed" "The pull request was closed without merging" "$hk_note" \
+    "Reopen it, or tell the agent to abandon the task."
+  _status_attention_per_task worktree-kept "$kept" "A worktree was kept because it still holds work" "$hk_note" \
+    "Commit or discard what is left in the task's worktree; the next housekeeping removes it."
 
   # 7. Knowledge nobody has agreed to yet reaches no agent (ADR-0016).
   if [ -n "$_SC_PROPOSALS" ] && [ "$_SC_PROPOSALS" -gt 0 ]; then
-    cards="$cards$(_status_card "Knowledge is waiting for your decision" "" "$_SC_PROPOSALS document(s) proposed" \
-      "Ask the agent: what's proposed? (jig-accept)")
-"
+    _status_attn knowledge-proposed project "" "" "Knowledge is waiting for your decision" \
+      "$_SC_PROPOSALS document(s) proposed" "Ask the agent: what's proposed? (jig-accept)"
   fi
   if [ -n "$_SC_SOURCES" ] && [ "$_SC_SOURCES" -gt 0 ]; then
-    cards="$cards$(_status_card "Adopted rule files changed since you approved them" "" "$_SC_SOURCES file(s)" \
-      "Ask the agent to go through the changed sources with you (jig-accept).")
-"
+    _status_attn sources-changed project "" "" "Adopted rule files changed since you approved them" \
+      "$_SC_SOURCES file(s)" "Ask the agent to go through the changed sources with you (jig-accept)."
   fi
-
-  printf '<section id="needs">\n<h2>Needs you</h2>\n'
-  if [ -n "$cards" ]; then
-    printf '<div class="cards">\n%s</div>\n' "$cards"
-  else
-    printf '<p class="nothing">Nothing needs you right now.</p>\n'
-    if [ -n "$_STATUS_HK_AT" ] && _status_hk_stale "$_STATUS_HK_AT" "$_STATUS_HK_FORGE"; then
-      printf '<p class="muted">Pull request data is stale, so a pull request waiting for you may be missing here.</p>\n'
-    fi
-  fi
-  printf '</section>\n'
 }
 
-# _status_cards <ids> <title> <detail> <todo> — one card per id, each ending
-# in a newline.
-_status_cards() {
+# _status_attention_per_task <kind> <ids> <title> <detail> <todo> — one item
+# per id.
+_status_attention_per_task() {
   local id
   while IFS= read -r id; do
     [ -n "$id" ] || continue
-    _status_card "$2" "$id" "$3" "$4"
-    printf '\n'
-  done <<EOF
-$1
-EOF
+    _status_attn "$1" task "$id" "$id" "$3" "$4" "$5"
+  done <<IDS
+$2
+IDS
 }
 
-# _status_phase_stop_cards <lines> — one "needs you" card per phase, from
+# _status_attention_phase_stops <lines> — one item per phase, from
 # `<phase>\t<task-id>\t<stop reason>` lines. Several stopped tasks of one
-# phase make one card with all of them listed: in a phase run the person is
+# phase make one item with all of them listed: in a phase run the person is
 # asked once, in the coordinator's session, about the whole wave — the page
 # says the same thing rather than handing them a card each
 # (adr-20260922-a-phase-run-is-coordinated).
-_status_phase_stop_cards() {
-  local lines="$1" phases="" phase id reason detail n
+_status_attention_phase_stops() {
+  local lines="$1" phases="" phase id reason detail n ids todo
   [ -n "$lines" ] || return 0
   phases=$(printf '%s\n' "$lines" | cut -f 1 | grep -v '^$' | sort -u)
   while IFS= read -r phase; do
     [ -n "$phase" ] || continue
-    detail="" n=0
+    detail="" n=0 ids=""
     while IFS="$(printf '\t')" read -r _ id reason; do
       [ -n "$id" ] || continue
       n=$((n + 1))
       detail="$detail${detail:+; }$id — $reason"
+      ids="$ids${ids:+ }$id"
     done < <(printf '%s\n' "$lines" | awk -F '\t' -v p="$phase" '$1 == p')
     if [ "$n" -gt 1 ]; then
-      _status_card "A phase run is waiting for you" "phase $phase" "$detail" \
-        "Answer in the coordinator's session; it resumes the tasks." "" \
-        '<span class="badge warn">autopilot stopped</span>'
+      todo="Answer in the coordinator's session; it resumes the tasks."
     else
-      _status_card "A phase run is waiting for you" "phase $phase" "$detail" \
-        "Answer in the coordinator's session; it resumes the task." "" \
-        '<span class="badge warn">autopilot stopped</span>'
+      todo="Answer in the coordinator's session; it resumes the task."
     fi
-    printf '\n'
+    _status_attn phase-stopped phase "$phase" "$ids" "A phase run is waiting for you" "$detail" "$todo"
   done < <(printf '%s\n' "$phases")
+}
+
+# --- `jig status --json` ----------------------------------------------------------
+#
+# What needs the reader, as data: the page's "Needs you" items
+# (_status_attention), in its order, in the envelope every `--json` read
+# prints (adr-20261015-a-read-is-one-json-envelope; schemas/json.md). It reads
+# what the page's redraw reads — the counts the last full run saved, never
+# counted again when they exist — and writes nothing: no page, no counts. Run in
+# a task worktree it reads the main checkout, as the page does (_status_json).
+
+# _status_json [--json] — the producer json_run runs for `jig status --json`.
+_status_json() {
+  local arg attn rec kind stype sid tasks title detail todo url objs="" o t tl hk stale root
+  for arg in "$@"; do
+    [ "$arg" = --json ] || jig_fail usage "status --json: unknown argument: $arg (usage: jig status --json)"
+  done
+  jig_require_repo
+  # A task worktree borrows the owner's workspaces (ADR-0029), and the runtime
+  # the page reads — the housekeeping log, the latest release, the saved
+  # counts — is the owner's too. So the read is the owner's checkout, as the
+  # page is, but answered by this jig: the envelope is always the one the
+  # caller asked, never an older main checkout's. This subshell is the
+  # producer's own, so nothing outside it sees the switch.
+  root=$(jig_config_clone_root)
+  if [ "$root" != "$JIG_PROJECT" ]; then
+    JIG_PROJECT=$root
+    cd "$root" || jig_die "status --json: cannot read the main checkout: $root"
+  fi
+  [ -f "$JIG_PROJECT/$JIG_AI_DIR/config.yaml" ] \
+    || jig_fail not-initialised "status --json: project is not initialised; run: jig init"
+  _status_load
+  # The counts the last full run saved for the page. Without them, only the
+  # two the items need are counted, and saved nowhere: what `jig upgrade`
+  # would install is the slowest of the three and no item reads it.
+  if ! _status_counts_read; then
+    _SC_PROPOSALS=$(km_proposed_count)
+    _SC_SOURCES=$(km_changed_sources_count)
+    _SC_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  fi
+  _status_live_collect page
+  _status_hk_load
+  attn=$(_status_attention)
+  while IFS= read -r rec; do
+    [ -n "$rec" ] || continue
+    IFS="$_STATUS_US" read -r kind stype sid tasks title detail todo url <<REC
+$rec
+REC
+    json_quote "$kind"; o="{\"kind\":$_JSON"
+    json_quote "$stype"; o="$o,\"subject\":{\"type\":$_JSON"
+    json_str_or_null "$sid"; o="$o,\"id\":$_JSON}"
+    tl=""
+    for t in $tasks; do
+      json_quote "$t"
+      tl="$tl${tl:+,}$_JSON"
+    done
+    o="$o,\"tasks\":[$tl]"
+    json_quote "$title"; o="$o,\"title\":$_JSON"
+    json_str_or_null "$detail"; o="$o,\"detail\":$_JSON"
+    json_quote "$todo"; o="$o,\"todo\":$_JSON"
+    json_str_or_null "$url"; o="$o,\"url\":$_JSON}"
+    objs="$objs${objs:+,}$o"
+  done <<ATTN
+$attn
+ATTN
+  hk=null
+  if [ -n "$_STATUS_HK_AT" ]; then
+    stale=false
+    ! _status_hk_stale "$_STATUS_HK_AT" "$_STATUS_HK_FORGE" || stale=true
+    json_quote "$_STATUS_HK_AT"; hk="{\"ran_at\":$_JSON"
+    json_str_or_null "$_STATUS_HK_FORGE"; hk="$hk,\"forge\":$_JSON,\"stale\":$stale}"
+  fi
+  json_str_or_null "$_SC_AT"
+  printf '{"attention":[%s],"housekeeping":%s,"knowledge_counts_at":%s}\n' "$objs" "$hk" "$_JSON"
 }
 
 # _status_html_phase_run — "Phase run": the roadmap phases a coordinator is
@@ -1374,9 +2304,12 @@ _status_phase_slots() {
 # started tasks, then ready ones, then tasks filed but not started; paused
 # tasks fold away below. The receipt is what `task receipt --check` answers
 # (task_receipt_check) and the blocking findings are _task_blocking_findings'
-# own lines.
+# own lines. When any of these tasks belongs to a spec, the rows are grouped as
+# the terminal groups them (_status_task_groups): a heading per epic or spec
+# with its progress, its own table under it, and "Other tasks" last.
 _status_html_tasks() {
   local rec rows="" paused_rows="" rank row tab
+  local -a ids=()
   tab=$(printf '\t')
   printf '<section id="tasks">\n<h2>Running now</h2>\n'
   while IFS= read -r rec; do
@@ -1394,16 +2327,21 @@ _status_html_tasks() {
     elif [ "$_ST_STATUS" = ready ]; then rank=3
     else rank=2
     fi
-    rows="$rows$rank$tab$row
+    ids+=("$_ST_ID")
+    rows="$rows$rank$tab$_ST_ID$tab$row
 "
   done <<EOF
 $_STATUS_LIVE
 EOF
-  if [ -n "$rows" ]; then
-    _status_html_task_table "$(printf '%s' "$rows" | sort -s -t "$tab" -k 1,1 | cut -f 2-)
+  _STG_KEYS=()
+  if [ ${#ids[@]} -gt 0 ]; then _status_task_groups "${ids[@]}"; fi
+  if [ -z "$rows" ]; then
+    printf '<p class="empty">Nothing is running.</p>\n'
+  elif [ ${#_STG_KEYS[@]} -eq 0 ]; then
+    _status_html_task_table "$(printf '%s' "$rows" | sort -s -t "$tab" -k 1,1 | cut -f 3-)
 "
   else
-    printf '<p class="empty">Nothing is running.</p>\n'
+    _status_html_task_groups "$(printf '%s' "$rows" | sort -s -t "$tab" -k 1,1 | cut -f 2-)"
   fi
   if [ -n "$paused_rows" ]; then
     printf '<details id="paused"><summary>Paused</summary>\n'
@@ -1414,6 +2352,47 @@ EOF
     printf '<p class="muted">%d finished, not listed (<code>jig task list --all</code>).</p>\n' "$_STATUS_FINISHED"
   fi
   printf '</section>\n'
+}
+
+# _status_html_task_groups <rows> — "<id><TAB><row>" lines, already in the
+# order "Running now" shows them, as one heading and table per group of
+# _STG_KEYS, then "Other tasks". A group's heading names its spec as the
+# specifications below do, says whether it is an epic, and draws its progress
+# with the phases' bar.
+_status_html_task_groups() {
+  local g=0 key id row body pct heading
+  while [ "$g" -le ${#_STG_KEYS[@]} ]; do
+    if [ "$g" -lt ${#_STG_KEYS[@]} ]; then
+      key=${_STG_KEYS[$g]}
+      heading="<h3><code>$(_status_h "$key")</code>"
+      # A spec with no heading of its own is titled by its id: said once.
+      [ "${_STG_TITLE[$g]}" = "$key" ] || heading="$heading $(_status_h "${_STG_TITLE[$g]}")"
+      heading="$heading <span class=\"badge\">$(_status_h "${_STG_KIND[$g]}")</span>"
+      if [ -n "${_STG_TOTAL[$g]}" ]; then
+        pct=0
+        [ "${_STG_TOTAL[$g]}" -eq 0 ] || pct=$((${_STG_DONE[$g]} * 100 / ${_STG_TOTAL[$g]}))
+        heading="$heading$(printf ' <span class="muted"><span class="bar"><span style="width: %d%%"></span></span>%s/%s done</span>' \
+          "$pct" "$(_status_h "${_STG_DONE[$g]}")" "$(_status_h "${_STG_TOTAL[$g]}")")"
+      fi
+      heading="$heading</h3>"
+    else
+      key="" heading="<h3>Other tasks</h3>"
+    fi
+    g=$((g + 1))
+    body=""
+    while IFS=$'\t' read -r id row; do
+      [ -n "$id" ] || continue
+      _status_group_of "$id"
+      [ "$_STG_SID" = "$key" ] || continue
+      body="$body$row
+"
+    done <<EOF
+$1
+EOF
+    [ -n "$body" ] || continue
+    printf '%s\n' "$heading"
+    _status_html_task_table "$body"
+  done
 }
 
 _status_html_task_table() {
@@ -1427,8 +2406,11 @@ _status_html_task_table() {
 # line.
 _status_html_task_row() {
   local blocking bline receipt cls
-  printf '<tr><td class="id"><code>%s</code></td><td>%s</td><td>%s' \
-    "$(_status_h "$_ST_ID")" "$(_status_h "${_ST_CLASS:--}")" "$(_status_h "$_ST_STATUS")"
+  printf '<tr><td class="id"><code>%s</code></td><td>%s' \
+    "$(_status_h "$_ST_ID")" "$(_status_h "${_ST_CLASS:--}")"
+  [ "$_ST_DEPTH" != lean ] || printf ' <span class="badge">lean</span>'
+  [ -z "$_ST_LOWERED" ] || printf ' <span class="badge warn">lowered from %s</span>' "$(_status_h "$_ST_LOWERED")"
+  printf '</td><td>%s' "$(_status_h "$_ST_STATUS")"
   if [ "$_ST_PAUSED" = "true" ]; then
     printf ' <span class="badge warn">paused</span>'
     [ -z "$_ST_REASON" ] || printf ' <span class="muted">%s</span>' "$(_status_h "$_ST_REASON")"
@@ -1530,7 +2512,8 @@ _status_html_specs() {
   done < <(printf '%s\n' "$rows")
   printf '</tbody>\n</table></div>\n'
 
-  phases=$(spec_phase_rows)
+  [ -n "$_STATUS_PHASE_READY" ] || _status_phase_rows_collect
+  phases=$_STATUS_PHASE_ROWS
   while IFS="$(printf '\t')" read -r id title state; do
     [ -n "$id" ] || continue
     _status_html_phases "$id" "$title" "$phases"
@@ -1586,6 +2569,8 @@ _status_html_summary() {
   local agent_git
   agent_git=$(_status_agent_git)
   _status_html_item "agent.git" "${agent_git#agent.git: }" 0
+  agent_git=$(_status_autopilot_git)
+  [ -z "$agent_git" ] || _status_html_item "autopilot.git" "${agent_git#autopilot.git: }" 0
   printf '</dl>\n</section>\n'
 }
 
@@ -1633,116 +2618,45 @@ _status_framework_versions() {
   printf '%s\n' "hint: run \`jig self-update\`, then \`jig upgrade --dry-run\`"
 }
 
-# _status_flagged_ids <flag> — the tasks <flag> still stands for: the ones the
-# last housekeeping run flagged with it, minus the ones a fact read from this
-# disk already contradicts. The one place that answer is decided; the page's
-# cards and the counts in both reports call it, so they cannot disagree.
+# _status_latest_release_available — the version housekeeping's daily
+# release check (.ai/runtime/latest-release, _hk_check_latest_release in
+# housekeeping.sh) found strictly newer than the global framework this
+# checkout uses, printed on success. Fails, printing nothing, on every other
+# outcome — no file yet, the recorded check "failed", or the recorded
+# version is not newer — since none of those is "you are current": task
+# status-says-a-newer-jig-exists is explicit that this reads "нет файла / не
+# удалось / не новее — ничего, никогда «у вас последняя»".
 #
-# The cut is the cost of asking again, not the kind of card. What a task's own
-# state file says, and whether a worktree is still on disk, are read here for
-# nothing, and the page is redrawn after every command -- so a card those
-# facts contradict is not built at all. What the forge saw (merged, closed,
-# open, work that landed on another branch) costs a network request, which
-# this page never makes on the write path
-# (adr-20260924-the-status-page-keeps-the-readers-place): those stay borrowed
-# and keep saying "as of" the run that saw them.
-_status_flagged_ids() {
-  local flag="$1" re
-  case "$flag" in
-    # The one flag whose name is not a literal regex.
-    'abandoned?') re='flags=[^ ]*abandoned[?]' ;;
-    *) re="flags=[^ ]*$flag" ;;
-  esac
-  _status_hk_recheck "$flag" "$(_status_hk_ids "$re")"
-}
-
-# _status_hk_recheck <flag> <ids> — <ids> without those the live answer
-# contradicts.
-#
-# A recheck may only contradict, never invent. A task with no state file, and
-# a kept worktree the log recorded no path for, keep their card: absence of an
-# answer is not an answer, and a page that hid cards because it failed to look
-# would be worse than one a run behind.
-_status_hk_recheck() {
-  local flag="$1" id
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    # The log is a file, and a line edited by hand can carry an id no command
-    # would accept. Asking a peer about one dies in `task_dir` -- inside a
-    # report, which may not fail on a peer's data, and by way of `jig_die`,
-    # which redraws the very page being drawn. So it is not asked: an id
-    # there is no way to check keeps its card, like every other answer the
-    # page does not have.
-    jig_valid_id "$id" || { printf '%s\n' "$id"; continue; }
-    case "$flag" in
-      needs-consolidation)
-        # "Merged" is borrowed and stays so; "nobody has closed it yet" is
-        # free to ask again, and closing the task is exactly what the card
-        # asks for (ADR-0030).
-        case "$(task_state_get "$id" status)" in
-          consolidated | abandoned) continue ;;
-        esac
-        ;;
-      'abandoned?')
-        # housekeeping_decide drops this flag for a task already abandoned
-        # (abandoned:closed). The page says the same thing a run earlier,
-        # instead of asking a question that has been answered.
-        [ "$(task_state_get "$id" status)" != abandoned ] || continue
-        ;;
-      worktree-kept)
-        _status_worktree_kept "$id" || continue
-        ;;
-      # wrong-base and anything new: only the forge and the history know, so
-      # the flag stands until the next run.
+# Offline and read-only, unlike _status_framework_versions above: the
+# network call already happened in housekeeping, at most once a cadence: this
+# only reads its answer and jig_declared_version's (no execution, same
+# reason jig_global_executable/jig_declared_version are used everywhere else
+# in this file rather than running the global `jig`).
+_status_latest_release_available() {
+  local file="$JIG_PROJECT/$JIG_AI_DIR/runtime/latest-release" latest="" global_exe global tok
+  [ -f "$file" ] || return 1
+  while IFS= read -r tok; do
+    case "$tok" in
+      latest=*) latest=${tok#latest=} ;;
     esac
-    printf '%s\n' "$id"
-  done <<EOF
-$2
-EOF
+  done < <(tr ' ' '\n' < "$file")
+  [ -n "$latest" ] || return 1
+  global_exe=$(jig_global_executable) || return 1
+  global=$(jig_declared_version "${global_exe%/scripts/jig}") || return 1
+  jig_release_version "v$latest" >/dev/null 2>&1 || return 1
+  jig_release_version "v$global" >/dev/null 2>&1 || return 1
+  jig_version_newer "$latest" "$global" || return 1
+  printf '%s\n' "$latest"
 }
 
-# _status_worktree_kept <id> — false when the worktree housekeeping kept for
-# <id> is gone from disk.
-#
-# The path comes from housekeeping's own `worktree=<path> action=keep` line,
-# not from the task's branch. The flag has two shapes -- a worktree of its own
-# and this checkout with the branch in it (_hk_checkout_keep) -- and a branch
-# lookup sees neither the second nor a worktree the page is being drawn
-# inside, since _task_worktrees leaves out the current checkout.
-_status_worktree_kept() {
-  local path
-  path=$(_status_hk_worktree "$1")
-  # Nothing recorded (an older log, or the checkout shape before it was
-  # logged): no contradiction, so the card stands.
-  [ -n "$path" ] || return 0
-  [ -d "$path" ]
-}
-
-# _status_hk_worktree <id> — the path of the worktree the last housekeeping run
-# kept for <id>, from its `action=keep` line; nothing when there is none.
-#
-# The task id is matched on the whole `task=` field, never as a substring:
-# `task=wk` must not answer for `task=wk2`. The path is cut between
-# ` worktree=` and the ` action=keep` that follows it rather than read as a
-# field, because the log writes it unquoted and a worktree path may hold
-# spaces; read field-wise it would come back truncated, and a truncated path
-# is not a directory, which would drop exactly the card this function is
-# meant to keep.
-_status_hk_worktree() {
-  local hk_log="$JIG_PROJECT/$JIG_AI_DIR/runtime/housekeeping.log"
-  [ -f "$hk_log" ] || return 0
-  JIG_HK_ID="$1" awk '
-    /^--- run / { p = ""; next }
-    {
-      id = ""
-      for (i = 1; i <= NF; i++) if ($i ~ /^task=/) id = substr($i, 6)
-      if (id != ENVIRON["JIG_HK_ID"]) next
-      a = index($0, " worktree=")
-      b = index($0, " action=keep")
-      if (a > 0 && b > a) p = substr($0, a + 10, b - a - 10)
-    }
-    END { if (p != "") print p }
-  ' "$hk_log"
+# _status_new_release_hint — the one line the plain-text report shows when
+# _status_latest_release_available found something; nothing otherwise
+# (task status-says-a-newer-jig-exists). The HTML page's own card
+# (_status_html_needs) reads the same answer, so the two never disagree.
+_status_new_release_hint() {
+  local latest
+  latest=$(_status_latest_release_available) || return 0
+  printf '%s\n' "hint: jig v$latest is out; run \`jig self-update\`, then \`jig upgrade\`"
 }
 
 # What .ai/config.local.yaml changes, and why a value in it does nothing
@@ -1758,6 +2672,9 @@ _status_config_local() {
   if [ -f "$file" ]; then
     while IFS="$(printf '\t')" read -r key value kind; do
       if [ "$kind" = local ]; then
+        # A secret's value lands in the transcript of the agent that runs
+        # this, so it is named and never shown (_cfg_secret_key, config.sh).
+        if _cfg_secret_key "$key"; then value=$JIG_CFG_MASK; fi
         printf 'config.local: %s=%s\n' "$key" "$value"
       else
         printf 'config.local: ignored %s (not a local key)\n' "$key"
@@ -1780,9 +2697,29 @@ _status_config_local() {
   # jig_config_project_ignored's two columns; the message names the key only.
   while IFS="$t" read -r pkey pvalue; do
     [ -n "$pkey" ] || continue
+    # A secret there is worse than a no-op: once pushed it is anyone's, and
+    # moving it to the local file does not take it back
+    # (adr-20261009-autopilot-stops-reach-telegram).
+    if _cfg_secret_key "$pkey"; then
+      printf 'config.local: %s in %s is ignored (set it in %s; a token in a committed file is anyone'"'"'s once pushed: revoke it with @BotFather)\n' \
+        "$pkey" "$JIG_AI_DIR/config.yaml" "$JIG_AI_DIR/config.local.yaml"
+      continue
+    fi
     printf 'config.local: %s in %s is ignored (set it in %s)\n' \
       "$pkey" "$JIG_AI_DIR/config.yaml" "$JIG_AI_DIR/config.local.yaml"
   done < <(jig_config_project_ignored)
+}
+
+# _status_notify — one line while the latest Telegram message failed
+# (jig_notify_failing, notify.sh): a wrong token or chat id, or a sandbox with
+# no network, would otherwise stay silent forever. A later success clears it.
+_status_notify() {
+  local at who why
+  IFS=$'\t' read -r at who why <<EOF
+$(jig_notify_failing)
+EOF
+  [ -n "$at" ] || return 0
+  printf 'notify: Telegram messages are failing: %s (%s, %s)\n' "$why" "$who" "$at"
 }
 
 # _status_agent_git — one line naming the review queue `agent.git`'s level
@@ -1803,6 +2740,26 @@ _status_agent_git() {
   else
     printf 'agent.git: invalid value %s (expected none|commit|push|pr|merge)\n' "$level"
   fi
+}
+
+# _status_autopilot_git — one line naming the level an autopilot run ships
+# at and the key it comes from (jig_autopilot_git, config.sh): `autopilot.git`
+# when this clone sets it, else `agent.git`. Always printed, like the
+# agent.git line: "a run ships the same as everything else" is the state a
+# person most needs to see before trusting a run further.
+_status_autopilot_git() {
+  local line level key rc=0
+  line=$(jig_autopilot_git) || rc=$?
+  level=${line%%$'\t'*}
+  key=${line#*$'\t'}
+  if [ "$rc" -eq 0 ]; then
+    printf 'autopilot.git: %s (from %s)\n' "$level" "$key"
+  elif [ "$key" = autopilot.git ]; then
+    printf 'autopilot.git: invalid value %s (expected none|commit|push|pr|merge)\n' "$level"
+  fi
+  # Nothing when it answers from an invalid agent.git: the agent.git line
+  # already names that, and a second failure for one mistake reads as two.
+  return 0
 }
 
 # Whether the housekeeping trigger is wired up for the installed runtimes.
@@ -1837,6 +2794,37 @@ _status_session_hook() {
       printf 'session hook (%s): not installed\n' "$a"
     else
       printf 'session hook (%s): installed\n' "$a"
+    fi
+  done
+}
+
+# Whether the runtime's notification hook reaches .ai/scripts/jig-notify-hook,
+# printed only while `notify.interactive` is true: before that the hook would
+# send nothing anyway, and a "not connected" line the reader never asked for
+# is one they cannot clear (adr-20261010-a-waiting-session-reaches-telegram).
+# The same adapter lookup as _status_session_hook; exit 2 — Codex — prints
+# nothing.
+_status_notify_hook() {
+  local source a adir hint rc
+  [ "$(cfg notify.interactive false)" = true ] || return 0
+  source=$(manifest_source 2>/dev/null) || return 0
+  [ -n "$source" ] || return 0
+  [ -d "$source/adapters" ] || return 0
+  # shellcheck source=lib/profiles.sh
+  . "$JIG_LIB/profiles.sh"
+  for a in $(cfg_list adapters "claude codex"); do
+    adir=$(adapters_dir "$source/adapters" "$a") || continue
+    [ -f "$adir/adapter.sh" ] || continue
+    # shellcheck disable=SC1090
+    . "$adir/adapter.sh"
+    command -v "adapter_${a}_notify_hook_hint" >/dev/null 2>&1 || continue
+    rc=0
+    hint=$("adapter_${a}_notify_hook_hint" "$JIG_PROJECT") || rc=$?
+    [ "$rc" = 2 ] && continue
+    if [ -n "$hint" ]; then
+      printf 'notify hook (%s): not connected (jig doctor shows the snippet)\n' "$a"
+    else
+      printf 'notify hook (%s): connected\n' "$a"
     fi
   done
 }

@@ -137,126 +137,9 @@ _verify_map_apply() {
 # stalled at 40 and 50 minutes were not running a suite, they were queued
 # behind eight of them. A refusal would break CI and honest parallel work; a
 # warning is the same prose that already failed.
-
-# _verify_busy_dir — where the record lives, or nothing.
 #
-# The clone's main checkout, which `jig_config_clone_root` already computes by
-# reading git's own files — one answer from every worktree, no `git` process.
-# ADR-0038 made reading there a named exception to ADR-0008; this extends it to
-# writing, because what is being protected belongs to no checkout: the CPU is
-# one per clone, and the eight runs were in eight different worktrees.
-_verify_busy_dir() {
-  local root
-  root=$(jig_config_clone_root) || return 1
-  [ -n "$root" ] || return 1
-  printf '%s/%s/runtime/verify\n' "$root" "$JIG_AI_DIR"
-}
-
-# _verify_busy_ttl — how long a record still counts, in seconds. `0` is a
-# duration the grammar already spells, and it switches the whole mechanism off:
-# the escape for someone who genuinely wants parallel local runs, without a new
-# flag to learn.
-#
-# One key with a working default, never one a person must fill. The duration
-# grammar is the framework's one (`jig_duration_seconds`), and a mistyped value
-# leaves the default standing rather than taking `jig verify` down.
-_verify_busy_ttl() {
-  local raw seconds
-  raw=$(cfg verify.busy_ttl "30m")
-  seconds=$(jig_duration_seconds "$raw" 2>/dev/null) || seconds=""
-  case "$seconds" in
-    '' | *[!0-9]*) seconds=1800 ;;
-  esac
-  printf '%s\n' "$seconds"
-}
-
-# _verify_busy_mtime <file> — the file's mtime in seconds, or nothing.
-#
-# The BSD-then-GNU pair the session hook and the checkout record use, but
-# **chosen on the value, never on the exit status** — and that distinction is
-# the whole of this comment, because getting it wrong silently disabled the
-# lock on every GNU system.
-#
-# `stat -f '%m' <file>` under GNU coreutils does not simply fail: `-f` means
-# --file-system, so `%m` is read as a FILE operand, which errors, and then the
-# real file prints a **file-system block on stdout**. The command exits
-# non-zero, so `cmd && return 0` falls through to the GNU form and appends the
-# real mtime to that block. The caller then holds several lines where it
-# expected a number, rejects them, and reads the record's holder as gone: on
-# Linux and in Git Bash the record was never once seen as live, and
-# `jig verify` never waited for anything. It passed on macOS, where BSD stat
-# answers the first form, which is exactly how it reached CI.
-#
-# `_jig_checkout_mtimes` survives the same idiom only because it reads its
-# output line by line and skips what is not numeric. This reads one file, so it
-# checks the value it got instead.
-_verify_busy_mtime() {
-  local out
-  out=$(stat -f '%m' "$1" 2>/dev/null) || out=""
-  case "$out" in
-    '' | *[!0-9]*) out=$(stat -c '%Y' "$1" 2>/dev/null) || out="" ;;
-  esac
-  case "$out" in
-    '' | *[!0-9]*) return 1 ;;
-  esac
-  printf '%s\n' "$out"
-}
-
-# _verify_busy_value <file> <key> — the first `<key>: <value>` line, read by the
-# shell alone. The CR is stripped explicitly because `read` keeps one where sed
-# would not, and this record may be written under Windows.
-_verify_busy_value() {
-  local file="$1" key="$2" line
-  [ -f "$file" ] || return 1
-  while IFS= read -r line || [ -n "$line" ]; do
-    line=${line%$'\r'}
-    case "$line" in
-      "$key: "*)
-        printf '%s\n' "${line#"$key": }"
-        return 0
-        ;;
-    esac
-  done < "$file"
-  return 1
-}
-
-# _verify_busy_holder <dir> <ttl> — "<age in seconds> <checkout>" when a live
-# run holds the record, nothing when none does.
-#
-# Two independent tests, and the record is live only when both pass:
-#
-#   1. `kill -0 <pid>` — a shell builtin, not `ps`, which ADR-0002 rules out
-#      and which behaves differently under Git Bash anyway. This is the normal
-#      path: a run killed by the sandbox gives the clone back at the next poll,
-#      and that is exactly the death this task was written about.
-#   2. the record's mtime is within the ttl — the backstop for when (1) is
-#      wrong: another user's process reads as dead (EPERM), a recycled pid
-#      reads as alive. Both errors are bounded. "Wrongly dead" is today's
-#      behaviour; "wrongly alive" waits no longer than the ttl.
-#
-# A record with no readable pid falls back to the ttl alone, so a torn read can
-# only cost a wait, never a wrong start.
-_verify_busy_holder() {
-  local dir="$1" ttl="$2" file mtime now age pid checkout
-  file="$dir/busy/run"
-  [ -f "$file" ] || return 1
-  mtime=$(_verify_busy_mtime "$file") || return 1
-  case "$mtime" in
-    '' | *[!0-9]*) return 1 ;;
-  esac
-  now=$(date +%s)
-  if [ "$now" -lt "$mtime" ]; then age=0; else age=$((now - mtime)); fi
-  [ "$age" -le "$ttl" ] || return 1
-  pid=$(_verify_busy_value "$file" pid) || pid=""
-  case "$pid" in
-    '' | *[!0-9]*) ;;
-    "$$") return 1 ;;
-    *) kill -0 "$pid" 2>/dev/null || return 1 ;;
-  esac
-  checkout=$(_verify_busy_value "$file" checkout) || checkout=""
-  [ -n "$checkout" ] || checkout="another checkout"
-  printf '%s %s\n' "$age" "$checkout"
-}
+# The record is read by jig_verify_busy_holder and its helpers in common.sh:
+# `jig upgrade` asks the same question before it replaces scripts.
 
 # _verify_busy_claim <dir> — take the record, or fail.
 #
@@ -315,9 +198,9 @@ _verify_busy_acquire() {
   # the mechanism is off there rather than queueing jobs meant to run at once.
   [ -z "${CI:-}" ] || return 0
 
-  ttl=$(_verify_busy_ttl)
+  ttl=$(jig_verify_busy_ttl)
   [ "$ttl" -gt 0 ] || return 0
-  dir=$(_verify_busy_dir) || return 0
+  dir=$(jig_verify_busy_dir) || return 0
   [ -n "$dir" ] || return 0
 
   # A `jig verify` started by a run that already holds this clone — a suite that
@@ -338,7 +221,7 @@ _verify_busy_acquire() {
       fi
       return 0
     fi
-    holder=$(_verify_busy_holder "$dir" "$ttl") || holder=""
+    holder=$(jig_verify_busy_holder "$dir" "$ttl") || holder=""
     if [ -z "$holder" ]; then
       # Nobody live is behind the record: take it back, by the two bounded
       # deletions above, and let the loop claim it. `mkdir` still decides
@@ -374,11 +257,58 @@ _verify_busy_acquire() {
   done
 }
 
+# _verify_skip_lines_all_scoped <output> — true when <output> (a covered
+# profile's captured run, one printed line per check) names at least one
+# "<check>: skip (…)" line and every such line's reason starts with "scope:".
+# That wording is the profile contract's own for a narrowed-out check
+# (ADR-0013's example, and every stack profile shipped with jig follows it:
+# profiles/{shell,php,node,go}/verify.sh). Output with no skip line at all is
+# read as the cautious default and answered false, same as an undeclared
+# scope capability elsewhere in this file: a profile that skipped everything
+# without saying why is a defect, not proof of narrowing.
+_verify_skip_lines_all_scoped() {
+  local line any=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      *": skip ("*)
+        any=1
+        case "$line" in
+          *": skip (scope:"*) ;;
+          *) return 1 ;;
+        esac
+        ;;
+    esac
+  done <<EOF
+$1
+EOF
+  [ "$any" = 1 ]
+}
+
+# _verify_count_left_to_ci <output> — how many of a profile's check lines say
+# a narrowed run left the full set to CI: a skip `<check>: skip (scope: …, full
+# set left to CI)` as jp_full_left_to_ci prints it, and a check that ran its
+# filters after an ALL beside them was dropped (`pass (…, full set left to CI)`).
+_verify_count_left_to_ci() {
+  local line n=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      RESULT\ *) ;;
+      *": "*" ("*", full set left to CI)") n=$((n + 1)) ;;
+    esac
+  done <<EOF
+$1
+EOF
+  printf '%s\n' "$n"
+}
+
 # _verify_cleanup — the one EXIT trap: temporary files and the run record. Its
 # variables are script-global, never `local`, because the trap runs after the
 # function that set them has returned (conventions/shell.md).
 _verify_cleanup() {
-  rm -f "${JIG_VERIFY_TMP:-}" "${JIG_VERIFY_MAP_TMP:-}" 2>/dev/null || true
+  if [ -n "${JIG_VERIFY_MAP_ALL_TMP:-}" ]; then
+    rm -f "$JIG_VERIFY_MAP_ALL_TMP.list" 2>/dev/null || true
+  fi
+  rm -f "${JIG_VERIFY_TMP:-}" "${JIG_VERIFY_MAP_TMP:-}" "${JIG_VERIFY_MAP_ALL_TMP:-}" 2>/dev/null || true
   if [ -n "${JIG_VERIFY_BUSY:-}" ]; then
     _verify_busy_release "$JIG_VERIFY_BUSY"
     JIG_VERIFY_BUSY=""
@@ -402,9 +332,11 @@ cmd_verify() {
   local list_only=0 explain=0 profile_given=0 profiles_words="" p pdir raw tok
   local scope=0 base="" nfiles=0 scope_ok note full=0 explicit=0 full_run
   local header="" base_branch base_ref mb map map_ok map_err
-  local incomplete=0 covered=0 explained=0 unknown=0 plan_output plan_bad
+  local incomplete=0 covered=0 explained=0 unknown=0 plan_output plan_bad hr_state hr_rt hr_text
+  local covered_needs_install=0 is_fallback=0 run_output ci_left=0
   JIG_VERIFY_TMP=""
   JIG_VERIFY_MAP_TMP=""
+  JIG_VERIFY_MAP_ALL_TMP=""
   JIG_VERIFY_BUSY=""
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -534,7 +466,7 @@ cmd_verify() {
 
   # One trap for both the temporary files and the run record: the record has to
   # come back on every exit, not only on a run that narrowed.
-  trap '_verify_cleanup' EXIT INT TERM
+  jig_on_exit '_verify_cleanup'
 
   if [ "$scope" = 1 ]; then
     JIG_VERIFY_TMP=$(mktemp "${TMPDIR:-/tmp}/jig-verify-files.XXXXXX") \
@@ -544,6 +476,40 @@ cmd_verify() {
   fi
 
   [ -z "$header" ] || printf '%s\n' "$header"
+
+  # Where the project's commands run, decided once for every profile
+  # (adr-20261001-checks-run-where-the-project-runs). A refusal means nothing
+  # was checked: exit 3, before anyone waits for the clone.
+  # shellcheck source=lib/runenv.sh
+  . "$JIG_LIB/runenv.sh"
+  unset JIG_RUN_EXEC
+  runenv_resolve
+  if [ -n "$RUNENV_REFUSAL" ]; then
+    printf 'verify: refused: %s\n' "$RUNENV_REFUSAL"
+    if [ "$explain" = 1 ]; then return 1; fi
+    return 3
+  fi
+  if [ "$explain" = 1 ] || [ -n "$RUNENV_EXEC" ] || [ -n "$RUNENV_PATH" ]; then
+    printf 'verify: checks run in %s\n' "$RUNENV_WHERE"
+  fi
+  # A host runtime that is not first on PATH (Herd, or run.path): every
+  # profile runs on this machine as before, with that directory first — the
+  # PHP a person's own terminal finds, not a capability a profile must learn.
+  if [ -n "$RUNENV_PATH" ]; then
+    PATH="$RUNENV_PATH:$PATH"
+    export PATH
+  fi
+
+  # On the host, say when its runtime is not the one the project asks for.
+  if [ "$explain" = 1 ] && [ -z "$RUNENV_EXEC" ]; then
+    # shellcheck source=lib/hostruntime.sh
+    . "$JIG_LIB/hostruntime.sh"
+    while IFS=$'\t' read -r hr_state hr_rt hr_text; do
+      case "$hr_state" in
+        mismatch | unknown) printf 'verify: warning: host %s: %s\n' "$hr_rt" "$hr_text" ;;
+      esac
+    done < <(hostruntime_report)
+  fi
 
   # Taken here, after every refusal above has had its chance: nobody should
   # wait for the clone only to be told their arguments were wrong.
@@ -577,7 +543,10 @@ cmd_verify() {
     # way. Asked before the checks below, so a profile that is installed but
     # broken still counts as "there was something to check": that is a defect to
     # fix, not a project nothing covers.
-    if ! profiles_is_fallback "$pdir"; then
+    is_fallback=0
+    if profiles_is_fallback "$pdir"; then
+      is_fallback=1
+    else
       covered=1
     fi
 
@@ -588,6 +557,9 @@ cmd_verify() {
       else
         printf 'SKIP %s: no verify.sh\n' "$p"
         skip=$((skip + 1))
+        # A missing verify.sh is a broken install, never scope narrowing: a
+        # covered profile in this state always needs a person's action.
+        [ "$is_fallback" = 1 ] || covered_needs_install=$((covered_needs_install + 1))
       fi
       continue
     fi
@@ -596,6 +568,26 @@ cmd_verify() {
       printf 'PLAN %s: unknown (profile does not support explain)\n' "$p"
       unknown=$((unknown + 1))
       continue
+    fi
+
+    # Under an environment, a profile that never declared it can reach it
+    # would run its checks on the host: it is not run at all, and says so.
+    if [ -n "$RUNENV_EXEC" ] && ! profiles_supports "$pdir" environment; then
+      if [ "$explain" = 1 ]; then
+        printf 'PLAN %s: unknown (not adapted to run in %s)\n' "$p" "$RUNENV_WHERE"
+        unknown=$((unknown + 1))
+      else
+        printf 'RESULT %s: skip (not adapted to run in %s; its checks were not run on the host)\n' "$p" "$RUNENV_WHERE"
+        skip=$((skip + 1))
+        [ "$is_fallback" = 1 ] || covered_needs_install=$((covered_needs_install + 1))
+      fi
+      continue
+    fi
+    if [ -n "$RUNENV_EXEC" ]; then
+      JIG_RUN_EXEC="$RUNENV_EXEC"
+      export JIG_RUN_EXEC
+    else
+      unset JIG_RUN_EXEC
     fi
 
     note=""
@@ -635,6 +627,17 @@ cmd_verify() {
         JIG_VERIFY_MAP_TMP=$(mktemp "${TMPDIR:-/tmp}/jig-verify-map.XXXXXX") \
           || jig_die "verify: cannot create temporary file"
         _verify_map_apply "$JIG_PROJECT/$map" "$JIG_VERIFY_TMP" > "$JIG_VERIFY_MAP_TMP"
+        # The same decisions for every tracked file that could call a changed
+        # function: a profile that narrows by caller needs the map's answer for
+        # a path the change did not touch, and must not parse the map itself.
+        JIG_VERIFY_MAP_ALL_TMP=$(mktemp "${TMPDIR:-/tmp}/jig-verify-mapall.XXXXXX") \
+          || jig_die "verify: cannot create temporary file"
+        { git -C "$JIG_PROJECT" ls-files -co --exclude-standard \
+            | grep -v -e '^tests/' -e '^docs/' -e '\.mdx\{0,1\}$' || true; } \
+          > "$JIG_VERIFY_MAP_ALL_TMP.list"
+        _verify_map_apply "$JIG_PROJECT/$map" "$JIG_VERIFY_MAP_ALL_TMP.list" \
+          > "$JIG_VERIFY_MAP_ALL_TMP"
+        rm -f "$JIG_VERIFY_MAP_ALL_TMP.list"
         map_ok=1
         note=" (scope: changed, $nfiles files, map $map)"
       fi
@@ -653,38 +656,54 @@ cmd_verify() {
       if [ "$map_ok" = 1 ]; then
         plan_output=$( cd "$JIG_PROJECT" \
           && JIG_VERIFY_EXPLAIN=1 JIG_VERIFY_SCOPE=changed JIG_VERIFY_FILES="$JIG_VERIFY_TMP" \
-             JIG_VERIFY_MAPPED="$JIG_VERIFY_MAP_TMP" bash "$pdir/verify.sh" )
+             JIG_VERIFY_BASE="$base" JIG_VERIFY_FULL_RUN="$full_run" \
+             JIG_VERIFY_MAPPED="$JIG_VERIFY_MAP_TMP" JIG_VERIFY_MAPPED_ALL="$JIG_VERIFY_MAP_ALL_TMP" bash "$pdir/verify.sh" )
       elif [ "$scope_ok" = 1 ]; then
         plan_output=$( cd "$JIG_PROJECT" \
-          && unset JIG_VERIFY_MAPPED \
+          && unset JIG_VERIFY_MAPPED JIG_VERIFY_MAPPED_ALL \
           && JIG_VERIFY_EXPLAIN=1 JIG_VERIFY_SCOPE=changed JIG_VERIFY_FILES="$JIG_VERIFY_TMP" \
+             JIG_VERIFY_BASE="$base" JIG_VERIFY_FULL_RUN="$full_run" \
              bash "$pdir/verify.sh" )
       else
         plan_output=$( cd "$JIG_PROJECT" \
-          && unset JIG_VERIFY_SCOPE JIG_VERIFY_FILES JIG_VERIFY_MAPPED \
+          && unset JIG_VERIFY_SCOPE JIG_VERIFY_FILES JIG_VERIFY_MAPPED JIG_VERIFY_MAPPED_ALL JIG_VERIFY_BASE JIG_VERIFY_FULL_RUN \
           && JIG_VERIFY_EXPLAIN=1 bash "$pdir/verify.sh" )
       fi
+      rc=$?
     elif [ "$map_ok" = 1 ]; then
-      ( cd "$JIG_PROJECT" \
+      run_output=$( cd "$JIG_PROJECT" \
         && unset JIG_VERIFY_EXPLAIN \
         && JIG_VERIFY_SCOPE=changed JIG_VERIFY_FILES="$JIG_VERIFY_TMP" \
-           JIG_VERIFY_MAPPED="$JIG_VERIFY_MAP_TMP" \
-           bash "$pdir/verify.sh" )
+             JIG_VERIFY_BASE="$base" JIG_VERIFY_FULL_RUN="$full_run" \
+           JIG_VERIFY_MAPPED="$JIG_VERIFY_MAP_TMP" JIG_VERIFY_MAPPED_ALL="$JIG_VERIFY_MAP_ALL_TMP" \
+           bash "$pdir/verify.sh" 2>&1 )
+      rc=$?
+      [ -z "$run_output" ] || printf '%s\n' "$run_output"
     elif [ "$scope_ok" = 1 ]; then
-      ( cd "$JIG_PROJECT" \
-        && unset JIG_VERIFY_EXPLAIN JIG_VERIFY_MAPPED \
+      run_output=$( cd "$JIG_PROJECT" \
+        && unset JIG_VERIFY_EXPLAIN JIG_VERIFY_MAPPED JIG_VERIFY_MAPPED_ALL \
         && JIG_VERIFY_SCOPE=changed JIG_VERIFY_FILES="$JIG_VERIFY_TMP" \
-           bash "$pdir/verify.sh" )
+             JIG_VERIFY_BASE="$base" JIG_VERIFY_FULL_RUN="$full_run" \
+           bash "$pdir/verify.sh" 2>&1 )
+      rc=$?
+      [ -z "$run_output" ] || printf '%s\n' "$run_output"
     else
+      # Never scope-aware (no --changed, or the profile declares no scope
+      # support): a skip here cannot be scope narrowing, so there is nothing
+      # to classify and the run streams live like every branch did before
+      # this change — run_output stays empty, which _verify_skip_lines_all_scoped
+      # reads as "not narrowed", the same answer this branch always gave.
+      run_output=""
       ( cd "$JIG_PROJECT" \
-        && unset JIG_VERIFY_EXPLAIN JIG_VERIFY_SCOPE JIG_VERIFY_FILES JIG_VERIFY_MAPPED \
+        && unset JIG_VERIFY_EXPLAIN JIG_VERIFY_SCOPE JIG_VERIFY_FILES JIG_VERIFY_MAPPED JIG_VERIFY_MAPPED_ALL JIG_VERIFY_BASE JIG_VERIFY_FULL_RUN \
         && bash "$pdir/verify.sh" )
+      rc=$?
     fi
-    rc=$?
     set -e
     if [ "$map_ok" = 1 ]; then
-      rm -f "$JIG_VERIFY_MAP_TMP"
+      rm -f "$JIG_VERIFY_MAP_TMP" "$JIG_VERIFY_MAP_ALL_TMP"
       JIG_VERIFY_MAP_TMP=""
+      JIG_VERIFY_MAP_ALL_TMP=""
     fi
 
     if [ "$explain" = 1 ]; then
@@ -700,13 +719,29 @@ cmd_verify() {
       continue
     fi
 
+    # A check whose full set a narrowed run left to CI (verify.full_run: ci,
+    # adr-0041 amendment 2026-10-08) is counted, so the summary can say the
+    # full set ran nowhere here and how to run it.
+    ci_left=$((ci_left + $(_verify_count_left_to_ci "$run_output")))
+
     # A run that died is neither a pass nor a fail. Exit code 3 is a profile
     # saying so; 128+N is the profile itself killed by a signal, which no
     # profile has to be taught — `Killed: 9` and `Terminated: 15` reach every
     # stack the same way.
     case "$rc" in
       0) pass=$((pass + 1)); printf 'RESULT %s: pass%s\n' "$p" "$note" ;;
-      2) skip=$((skip + 1)); printf 'RESULT %s: skip%s\n' "$p" "$note" ;;
+      2)
+        skip=$((skip + 1))
+        # A profile that skipped every check of its own either had nothing in
+        # scope (every "<check>: skip (…)" line names a scope reason, ADR-0013's
+        # own wording) or hit a real gap (a missing tool, a broken check) — and
+        # only the second is a person's to fix. Absence of any skip line at all
+        # is read as the cautious default, same as an undeclared capability.
+        if [ "$is_fallback" != 1 ] && ! _verify_skip_lines_all_scoped "$run_output"; then
+          covered_needs_install=$((covered_needs_install + 1))
+        fi
+        printf 'RESULT %s: skip%s\n' "$p" "$note"
+        ;;
       3)
         incomplete=$((incomplete + 1))
         printf 'RESULT %s: incomplete%s\n' "$p" "$note"
@@ -733,6 +768,10 @@ cmd_verify() {
 
   printf 'verify: %d profiles, %d pass, %d fail, %d skip, %d incomplete\n' \
     "$total" "$pass" "$failn" "$skip" "$incomplete"
+  if [ "$ci_left" -gt 0 ]; then
+    printf 'verify: %d check(s) left their full set to CI (verify.full_run: ci); jig verify --full runs it here\n' \
+      "$ci_left"
+  fi
   # Incomplete outranks fail: a run something was killed in is not evidence, so
   # the failures in it cannot be trusted either. Nothing is lost — a real
   # failure comes back on the next run, and an artefact of an overloaded
@@ -747,24 +786,46 @@ cmd_verify() {
   # reported success having examined not one line of it, and `jig task ship` and
   # the autopilot read that code.
   #
-  # But "nothing was checked" is two states, and only one of them is anybody's
-  # fault. **The difference is whether there was anything to check.**
+  # But "nothing was checked" is three states, and only one of them is
+  # anybody's fault. **The difference is whether there was anything to check,
+  # and whether the change at hand was the reason it went unchecked.**
   #
-  #   - A profile covering this stack took part and every check skipped: the
-  #     stack was recognised and its tools are missing. There was something to
-  #     check and it was not checked, for a reason somebody can fix. That is the
-  #     blind pass this rule exists to stop, and it is refused — exit 3, sharing
-  #     the code with the killed run because both mean no verdict was produced.
-  #   - Only fallback profiles took part: no profile covers this project at all.
-  #     There is nothing to install and nothing to wait for, so refusing would
-  #     stop work over a state the person cannot resolve. It does not refuse —
-  #     and it does not say `ok` either. It says plainly that nothing was
-  #     checked, and `jig task ship` says it again at the moment of shipping,
-  #     where it has consequences, rather than only here ten minutes earlier.
+  #   - A profile covering this stack took part and every check skipped for a
+  #     reason of its own (a missing tool, a broken verify.sh): the stack was
+  #     recognised and there was something to check that was not, for a reason
+  #     somebody can fix. That is the blind pass this rule exists to stop, and
+  #     it is refused — exit 3, sharing the code with the killed run because
+  #     both mean no verdict was produced.
+  #   - Only fallback profiles took part: no profile covers this project at
+  #     all. There is nothing to install and nothing to wait for, so refusing
+  #     would stop work over a state the person cannot resolve.
+  #   - Every skip came from scope narrowing: a profile covers this stack and
+  #     its tools are fine, but this diff does not touch anything within its
+  #     scope — either `jig verify` narrowed it to no changed files at all
+  #     before the profile ever ran, or the profile ran and every check of its
+  #     own said so (ADR-0013's own wording: every "<check>: skip (…)" line
+  #     names a scope reason). A docs-only change beside a `shell` profile is
+  #     exactly this. Nothing here is broken and nothing needs installing; the
+  #     narrowing did exactly what it was asked to. Refusing would repeat the
+  #     wrong advice this rule exists to stop, just from a different cause.
+  #
+  # The last two states share their answer — there is no action for the
+  # person to take, so this does not refuse — but not their text, since only
+  # the first names a stack this project actually has. `covered_needs_install`
+  # counts covered profiles whose skip does NOT reduce to scope narrowing:
+  # zero of those, and the state is the third one above, not the first.
   if [ "$pass" -eq 0 ] && [ "$failn" -eq 0 ] && [ "$total" -gt 0 ]; then
-    if [ "$covered" = 1 ]; then
+    if [ "$covered" = 1 ] && [ "$covered_needs_install" -gt 0 ]; then
       printf 'verify: nothing was checked, so this is not a pass — install the project'"'"'s tools so its profile can run\n'
       return 3
+    fi
+    if [ "$covered" = 1 ] && [ "$ci_left" -gt 0 ]; then
+      printf 'verify: every check in scope skipped or left its full set to CI, so this run verified nothing here\n'
+      return 0
+    fi
+    if [ "$covered" = 1 ]; then
+      printf 'verify: every check in scope skipped — this change touches nothing any profile covers, so this run verified nothing\n'
+      return 0
     fi
     printf 'verify: nothing here checks this project — no profile covers it, so this run verified nothing\n'
     return 0

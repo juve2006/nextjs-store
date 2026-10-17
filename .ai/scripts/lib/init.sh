@@ -48,6 +48,7 @@ _init_update_config_list() {
   local file="$1" key="$2" words="$3" bracket tmp
   bracket="[$(_init_words_to_csv "$words")]"
   tmp="$file.tmp.$$"
+  jig_cleanup_add "$tmp"
   sed "s/^${key}:.*/${key}: ${bracket}/" "$file" > "$tmp"
   mv "$tmp" "$file"
 }
@@ -214,6 +215,7 @@ _INIT_HASH_TMP=""
 _init_install_skill_staged() {
   local adapter_name="$1" skill_src="$2" rel
   _INIT_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/jig-init-stage.XXXXXX")
+  jig_cleanup_add -d "$_INIT_STAGE"
   while IFS= read -r rel; do
     [ -z "$rel" ] && continue
     _init_copy_framework_file "$_INIT_STAGE/$rel" "$JIG_PROJECT/$rel"
@@ -308,10 +310,6 @@ cmd_init() {
   . "$JIG_LIB/manifest.sh"
   # shellcheck source=lib/section.sh
   . "$JIG_LIB/section.sh"
-
-  # Cleanup net for _init_install_skill_staged's staging directory: fires on
-  # a mid-install jig_die (e.g. a conflicting write) as well as on interrupt.
-  trap '[ -n "$_INIT_STAGE" ] && rm -rf "$_INIT_STAGE"; [ -n "$_INIT_HASH_TMP" ] && rm -rf "$_INIT_HASH_TMP"' EXIT INT TERM
 
   local source
   if [ -n "$from" ]; then
@@ -451,6 +449,7 @@ cmd_init() {
     adapters_bracket="[$(_init_words_to_csv "$adapters_words")]"
     base_branch=$(_init_default_branch)
     tmp_cfg="$cfg_dest.tmp.$$"
+    jig_cleanup_add "$tmp_cfg"
     sed -e "s/^profiles:.*/profiles: $profiles_bracket/" \
         -e "s/^adapters:.*/adapters: $adapters_bracket/" \
         -e "s|^git\.base_branch: main |git.base_branch: $base_branch |" \
@@ -672,6 +671,7 @@ cmd_init() {
     # in the batch leaves the previous manifest untouched instead of
     # replacing it with a truncated one.
     _INIT_HASH_TMP=$(mktemp -d "${TMPDIR:-/tmp}/jig-init-hash.XXXXXX")
+    jig_cleanup_add -d "$_INIT_HASH_TMP"
     local need_file="$_INIT_HASH_TMP/rel"
     local hash_file="$_INIT_HASH_TMP/hash" entries="$_INIT_HASH_TMP/entries"
     : > "$need_file"; : > "$entries"

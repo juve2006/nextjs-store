@@ -30,26 +30,63 @@
 # the caller's locals (cmd_doctor), updated here by dynamic scope — the same
 # pattern _upgrade_process_path uses for new_entries, so no check has to
 # thread three counters through every call.
+#
+# The lines go through the shared output layer (output.sh). In a pipe they are
+# printed at once, as each check runs, in exactly the bytes doctor printed
+# before the layer existed. At a terminal they are kept (`ok_names`,
+# `problems`, cmd_doctor's locals) and _doctor_report prints them at the end
+# in the order a person reads them: what needs them first, with its fix, and
+# every passing check in one line (adr-20261005-output-is-decorated-only-on-a-terminal).
 
-_doctor_line() {
-  printf '%-6s%s: %s\n' "$1" "$2" "$3"
+# _doctor_record <level> <check> <text> [<fix>]
+_doctor_record() {
+  if ! out_terminal; then
+    out_status "$1" "$2: $3"
+    [ -z "${4:-}" ] || out_detail fix "$4"
+    return 0
+  fi
+  if [ "$1" = ok ]; then
+    ok_names+=("$2")
+  else
+    problems+=("$1" "$2" "$3" "${4:-}")
+  fi
 }
 
 _doctor_ok() {
-  _doctor_line ok "$1" "$2"
+  _doctor_record ok "$1" "$2"
   ok_count=$((ok_count + 1))
 }
 
 _doctor_warn() {
-  _doctor_line warn "$1" "$2"
+  _doctor_record warn "$1" "$2" "${3:-}"
   warn_count=$((warn_count + 1))
-  [ -z "${3:-}" ] || printf '      fix: %s\n' "$3"
 }
 
 _doctor_fail() {
-  _doctor_line fail "$1" "$2"
+  _doctor_record fail "$1" "$2" "${3:-}"
   fail_count=$((fail_count + 1))
-  [ -z "${3:-}" ] || printf '      fix: %s\n' "$3"
+}
+
+# _doctor_report — the terminal form's body, printed once every check has run:
+# failures, then warnings, each with its fix, then the passing checks as one
+# group. `problems` holds four fields per entry: level, check, text, fix.
+_doctor_report() {
+  local level i n=${#problems[@]} shown=0
+  out_terminal || return 0
+  for level in fail warn; do
+    i=0
+    while [ "$i" -lt "$n" ]; do
+      if [ "${problems[$i]}" = "$level" ]; then
+        out_status "$level" "${problems[$((i + 1))]}: ${problems[$((i + 2))]}"
+        [ -z "${problems[$((i + 3))]}" ] || out_detail fix "${problems[$((i + 3))]}"
+        shown=1
+      fi
+      i=$((i + 4))
+    done
+  done
+  [ "${#ok_names[@]}" -gt 0 ] || return 0
+  [ "$shown" = 0 ] || out_gap
+  out_group ok "${#ok_names[@]} passed" "${ok_names[@]}"
 }
 
 # _doctor_bracket_list <value> — an `.ai/manifest` or `.ai/config.yaml`
@@ -151,6 +188,70 @@ _doctor_check_jigcmd_global() {
   else
     _doctor_warn "jig.cmd (global)" "missing next to $exe" \
       "update the global framework (jig self-update)"
+  fi
+}
+
+# Newest published release, asked of the global checkout's own origin — the
+# same channel `jig self-update` moves along (self-update.sh), but read-only:
+# `git ls-remote --tags origin` never touches the checkout, matching the rest
+# of doctor (file header: "a reporting command ... it never writes
+# anything"). Distinct from _doctor_check_framework_version above, which only
+# compares the project's manifest against whatever `jig` PATH selects and can
+# read "current" when both are simply stale together — it never asks
+# upstream. The owner's request was exactly this gap: "add a request to git
+# and check the latest version" (task doctor-says-a-newer-jig-exists).
+#
+# The check itself — `git ls-remote --tags` bounded by a manual poll-and-kill
+# timeout — is `jig_check_newest_release` (common.sh): housekeeping's own
+# daily release check (housekeeping.sh, task status-says-a-newer-jig-exists)
+# asks the same question of the same kind of checkout, and a second
+# implementation here would be the one this file's own header warns against
+# elsewhere in the codebase. This function is doctor's wording on top of it.
+#
+# Three outcomes, kept distinct on purpose: newer available, this is the
+# newest, or the answer could not be obtained — the third is never folded
+# into the second (an absent answer is not a good answer, ADR-0017's "unknown
+# is not zero").
+
+# _doctor_check_newest_release <global_exe> — nothing to check without a
+# global jig (_doctor_check_global_jig above already warned about that) or
+# without a readable declared version (it already warned "version
+# unreadable" too; a second, contradictory-sounding line here would not help
+# the reader).
+_doctor_check_newest_release() {
+  local exe="$1" root current rc best best_v
+  [ -n "$exe" ] || return 0
+  root="${exe%/scripts/jig}"
+  current=$(jig_declared_version "$root") || return 0
+  rc=0
+  best=$(jig_check_newest_release "$root" "$_JIG_RELEASE_CHECK_TIMEOUT") || rc=$?
+  case "$rc" in
+    0) ;;
+    1)
+      _doctor_warn "latest release" "could not check: no origin remote at $root"
+      return 0
+      ;;
+    3)
+      _doctor_warn "latest release" \
+        "could not check: origin did not answer within ${_JIG_RELEASE_CHECK_TIMEOUT}s"
+      return 0
+      ;;
+    4)
+      _doctor_warn "latest release" "could not check: origin has no release tag"
+      return 0
+      ;;
+    *)
+      _doctor_warn "latest release" "could not check: git ls-remote origin failed" \
+        "check network access and the origin remote at $root"
+      return 0
+      ;;
+  esac
+  best_v=$(jig_release_version "$best")
+  if jig_version_lt "$current" "$best_v"; then
+    _doctor_warn "latest release" "$best available (this checkout: v$current)" \
+      "jig self-update, then jig upgrade"
+  else
+    _doctor_ok "latest release" "up to date (v$current)"
   fi
 }
 
@@ -317,6 +418,40 @@ _doctor_check_session_hooks() {
   done
 }
 
+# The notification hook, checked only while `notify.interactive` is true
+# (status.sh, _status_notify_hook, says why). The snippet is printed here,
+# where the reader asked for a diagnosis; Jig never writes it into the
+# runtime's settings (ADR-0024).
+_doctor_check_notify_hooks() {
+  local source a adir hint rc
+  [ "$(cfg notify.interactive false)" = true ] || return 0
+  source=$(manifest_source 2>/dev/null) || return 0
+  [ -n "$source" ] || return 0
+  [ -d "$source/adapters" ] || return 0
+  # shellcheck source=lib/profiles.sh
+  . "$JIG_LIB/profiles.sh"
+
+  for a in $(_doctor_bracket_list "$(manifest_header_get adapters)"); do
+    adir=$(adapters_dir "$source/adapters" "$a") || continue
+    [ -f "$adir/adapter.sh" ] || continue
+    # shellcheck disable=SC1090
+    . "$adir/adapter.sh"
+    command -v "adapter_${a}_notify_hook_hint" >/dev/null 2>&1 || continue
+    rc=0
+    hint=$("adapter_${a}_notify_hook_hint" "$JIG_PROJECT") || rc=$?
+    if [ "$rc" = 2 ]; then
+      _doctor_ok "notify hook ($a)" "not applicable to this runtime"
+      continue
+    fi
+    if [ -n "$hint" ]; then
+      printf '%s\n' "$hint"
+      _doctor_warn "notify hook ($a)" "not connected" "add the snippet above to your own settings"
+    else
+      _doctor_ok "notify hook ($a)" "connected"
+    fi
+  done
+}
+
 # Whether each installed runtime's instruction file carries Jig's workflow; the
 # adapter answers, as for the session hook. A warn, not a fail: jig itself
 # works, but the agent will not follow its routes until the section is merged.
@@ -427,12 +562,45 @@ _doctor_check_agent_git() {
   fi
 }
 
+# Whether the runtime the project's checks would meet on this machine is one
+# the project asks for (hostruntime.sh answers, from composer.json,
+# package.json and .python-version). Asked only where the checks run on the
+# host: with an environment prefix the host's PHP is not the one that runs.
+# Silent when the project states no requirement, and when verify would refuse
+# to run at all (that is verify's message to give).
+_doctor_check_host_runtime() {
+  local state rt text
+  # shellcheck source=lib/runenv.sh
+  . "$JIG_LIB/runenv.sh"
+  # shellcheck source=lib/hostruntime.sh
+  . "$JIG_LIB/hostruntime.sh"
+  runenv_resolve
+  if [ -n "$RUNENV_REFUSAL" ] || [ -n "$RUNENV_EXEC" ]; then return 0; fi
+  while IFS=$'\t' read -r state rt text; do
+    [ -n "$state" ] || continue
+    case "$state" in
+      ok) _doctor_ok "host $rt" "$text" ;;
+      mismatch)
+        _doctor_warn "host $rt" "$text" \
+          "run the checks where the project runs (jig config set run.exec '<prefix>' --local, or ask the jig-setup skill), or switch this machine's $rt to the project's version"
+        ;;
+      *) _doctor_warn "host $rt" "$text" "compare the versions by hand" ;;
+    esac
+  done < <(hostruntime_report)
+}
+
 # --- cmd_doctor ---------------------------------------------------------------
 
 cmd_doctor() {
   [ $# -eq 0 ] || jig_die "doctor: unknown argument: $1"
 
+  # shellcheck source=lib/output.sh
+  . "$JIG_LIB/output.sh"
+  out_init
+
   local ok_count=0 warn_count=0 fail_count=0
+  # Kept by _doctor_record at a terminal, printed by _doctor_report.
+  local ok_names=() problems=()
   # Set by _doctor_check_framework_version, read by _doctor_check_upgrade.
   local version_state="" version_project=""
   local global_exe=""
@@ -443,6 +611,7 @@ cmd_doctor() {
   _doctor_check_global_jig "$global_exe"
   _doctor_check_link_kind
   _doctor_check_jigcmd_global "$global_exe"
+  _doctor_check_newest_release "$global_exe"
 
   local repo=""
   repo=$(jig_repo_root) || repo=""
@@ -462,15 +631,18 @@ cmd_doctor() {
       _doctor_check_executable_bits
       _doctor_check_jigcmd_project
       _doctor_check_session_hooks
+      _doctor_check_notify_hooks
       _doctor_check_instructions
       _doctor_check_config_local
       _doctor_check_config_keys
       _doctor_check_agent_git
+      _doctor_check_host_runtime
     else
       _doctor_warn "project" "not initialised" "jig init"
     fi
   fi
 
-  printf 'doctor: %d ok, %d warn, %d fail\n' "$ok_count" "$warn_count" "$fail_count"
+  _doctor_report
+  out_summary "doctor: $ok_count ok, $warn_count warn, $fail_count fail"
   [ "$fail_count" -eq 0 ]
 }
