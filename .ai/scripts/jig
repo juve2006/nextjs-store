@@ -50,10 +50,12 @@ Usage: jig <command> [args]
   init [--from <dir>] [--link] [--session-hook]
                                  bootstrap .ai/ in the current repository
   upgrade [--from <dir>]         update framework-owned files (manifest-aware)
-  status [--html | --open]       active tasks, housekeeping flags, drift;
+  status [--html | --open | --json]
+                                 active tasks, housekeeping flags, drift;
                                  --html writes the status page to .ai/runtime/status.html,
                                  --open writes it and opens it in the browser; once it
-                                 exists, task, spec and housekeeping commands keep it current
+                                 exists, task, spec and housekeeping commands keep it current;
+                                 --json prints what needs you as data (schemas/json.md)
   task new|start|set|abandon ... task workspace and state (new files it, start begins it)
   task changes <id> --base <ref> inventory all change layers; --files and --format paths
   task artifacts <id> [...]      fixed-route inputs; --provided names conversation outputs
@@ -87,6 +89,9 @@ Usage: jig <command> [args]
   spec new <id>                  create .ai/specs/<id>/ from the specification templates
   spec list                      specifications under .ai/specs/ and their roadmap progress
   spec done <task-id>            check the roadmap items that name a spec-linked task
+  spec link <spec-id> <task-id>  link a filed, not-started task to the spec phase naming it
+  spec stop <id> --phase <n> --reason <text>
+                                 record a phase run's stop: the reason goes to your Telegram
   spec close <id> [--leftovers-handled]
                                  remove a spec whose roadmap is done (no epic)
   spec epic <id> [--finish [--leftovers-handled] | --reopen]
@@ -104,6 +109,9 @@ Usage: jig <command> [args]
                                  that no reader answers from
   config keys                    every key jig reads, its default, which file
                                  answers for it, and what .ai/config.yaml omits
+  notify setup                   in your own terminal: ask for the Telegram bot token
+                                 (hidden) and chat id, write them, send a test message
+  notify test                    send one Telegram test message now, as autopilot would
   measure                        knowledge quality, process weight, change size
   doctor                         check the local environment jig runs in
   self-update                    move the global framework checkout to the newest release
@@ -117,7 +125,7 @@ main() {
   case "$cmd" in
     help|-h|--help) jig_usage ;;
     version|--version) printf 'jig %s\n' "$JIG_VERSION" ;;
-    init|upgrade|status|task|context|verify|knowledge|spec|housekeeping|measure|doctor|config)
+    init|upgrade|status|task|context|verify|knowledge|spec|housekeeping|measure|doctor|config|notify)
       if [ ! -f "$JIG_LIB/$cmd.sh" ]; then
         jig_die "command '$cmd' is not available in jig $JIG_VERSION"
       fi

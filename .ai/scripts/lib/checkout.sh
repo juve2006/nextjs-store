@@ -388,7 +388,19 @@ _jig_checkout_write() {
 
 # jig_checkout_record <command-words...> — called by the dispatcher before the
 # command runs. Writes at most two records and prints nothing.
+#
+# JIG_INTERNAL_REDRAW marks the re-entries that are not a session: the status
+# page's own redraw (jig_status_page_touch, common.sh) re-runs `jig status
+# --refresh|--html` as a subprocess, because none of the writers that trigger
+# it may source status.sh (ARCHITECTURE.md, Scripts layout); and a review
+# receipt's check runs `jig context` in the task's checkout to hash the
+# knowledge it read (_task_receipt_context_hash, task.sh), from any command
+# that asks it — `task list --json` among them. Recording either run as work
+# would overwrite `runtime/checkout`'s `command:` with a line nobody ran — a
+# redraw or a read, not a session
+# (adr-20260924-a-checkout-records-what-is-happening-in-it).
 jig_checkout_record() {
+  [ -z "${JIG_INTERNAL_REDRAW:-}" ] || return 0
   _jig_checkout_record_inner "$@" || true
   return 0
 }
@@ -480,7 +492,16 @@ _jig_checkout_told_file() {
 #
 # stderr, not stdout: `jig task current` prints an id that callers read as one
 # (ADR-0012), and an advisory must not become part of it.
+#
+# JIG_INTERNAL_REDRAW excludes the status page's own re-entry, the same guard
+# jig_checkout_record uses and for the same reason: `status --refresh` run
+# from jig_status_page_touch is not a reader orienting itself, and letting it
+# through consumed the moved-HEAD notice a neighbour was owed — silently,
+# since jig_status_page_touch discards this subprocess's stderr — before that
+# neighbour's own next orienting command ever ran
+# (adr-20260924-a-checkout-records-what-is-happening-in-it).
 jig_checkout_notice() {
+  [ -z "${JIG_INTERNAL_REDRAW:-}" ] || return 0
   _jig_checkout_orienting "$@" || return 0
   _jig_checkout_notice_inner || true
   return 0
@@ -502,8 +523,9 @@ _jig_checkout_notice_inner() {
   if [ -n "$told" ]; then
     printf 'checkout: HEAD here moved %s -> %s since you were told\n' "$told" "$head" >&2
     printf '  another session may be working on this checkout; to give the branch\n' >&2
-    printf '  back, move that task to a worktree of its own — do not just switch\n' >&2
-    printf '  this checkout back under it\n' >&2
+    printf '  back, move that task to a worktree of its own with\n' >&2
+    printf '  "jig task start <id> --worktree" — do not just switch this checkout\n' >&2
+    printf '  back under it\n' >&2
   fi
 
   # A session's own file holds this one key and nothing else. The shared file
@@ -575,13 +597,48 @@ jig_checkout_busy() {
   return 0
 }
 
+# jig_checkout_occupants [<id to ignore>] — the records of jig_checkout_busy
+# that occupy this checkout's HEAD, in the same "<name> <seconds> <command>"
+# lines. The one rule for every command that moves HEAD here: `task start`
+# and `upgrade` both refuse on it, and neither keeps a filter of its own
+# (adr-20260924-a-checkout-records-what-is-happening-in-it,
+# adr-20260930-an-upgrade-is-a-unit-of-work).
+#
+# A report may say "someone is here" on weak evidence; a refusal blocks a
+# person, so it is narrower: a record occupies HEAD when it is named by a task
+# that has been started (its state has a `branch`), is not `consolidated` or
+# `abandoned`, and whose branch is the one checked out here. A record named by
+# a session id, a task that was only filed, a closed one, or one whose branch
+# went back to the base has no HEAD here to lose, whatever its age says.
+#
+# State is read by the shell alone (_jig_checkout_read): this file never
+# sources task.sh, and a fork per record is the shape conventions/shell.md
+# forbids.
+jig_checkout_occupants() {
+  local ignore="${1:-}" head name age cmd state
+  _jig_checkout_ready || return 0
+  head=$(_jig_checkout_head)
+  [ -n "$head" ] || return 0
+  while read -r name age cmd; do
+    [ -n "$name" ] || continue
+    state="$JIG_PROJECT/$JIG_AI_DIR/workspace/tasks/$name/state"
+    [ -f "$state" ] || continue
+    _jig_checkout_read "$state" status || _JIG_CHECKOUT_READ=""
+    case "$_JIG_CHECKOUT_READ" in consolidated | abandoned) continue ;; esac
+    _jig_checkout_read "$state" branch || continue
+    [ "$_JIG_CHECKOUT_READ" = "$head" ] || continue
+    printf '%s %s %s\n' "$name" "$age" "$cmd"
+  done < <(jig_checkout_busy "$ignore")
+  return 0
+}
+
 # jig_checkout_here_task — the task whose branch is checked out here, empty
 # when none is. `jig status` excludes it from the list of work going on here:
 # the reader is sitting on it and does not need to be told.
 #
-# The refusal in `task start` deliberately does *not* exclude it. Two sessions
-# in one checkout, one of them on another task's branch, is the case that has
-# to be caught, and hiding that task's record would hide exactly it.
+# The refusals deliberately do *not* exclude it (jig_checkout_occupants). Two
+# sessions in one checkout, one of them on another task's branch, is the case
+# that has to be caught, and hiding that task's record would hide exactly it.
 jig_checkout_here_task() {
   _jig_checkout_ready || return 0
   _jig_checkout_name_from_head "$(_jig_checkout_head)" || printf ''

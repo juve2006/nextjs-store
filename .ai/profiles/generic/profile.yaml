@@ -1,6 +1,6 @@
 # Profile manifest. Flat YAML subset, same reader as .ai/config.yaml.
 name: generic
-scope: [explain]
+scope: [explain, environment]
 description: Baseline profile, always active.
 detect: always
 # What this profile claims about the code: nothing. It has no checks of its own

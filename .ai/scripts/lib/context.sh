@@ -84,6 +84,7 @@ ctx_stateless() {
   elif [ "$no_task" -eq 0 ]; then
     local tc_rc=0 tc_err_file
     tc_err_file=$(mktemp "${TMPDIR:-/tmp}/jig-context-current.XXXXXX")
+    jig_cleanup_add "$tc_err_file"
     task_id=$(task_current 2>"$tc_err_file") || tc_rc=$?
     [ "$tc_rc" -eq 2 ] && cat "$tc_err_file" >&2
     [ "$tc_rc" -eq 0 ] || task_id=""
@@ -167,18 +168,10 @@ workspace${t}${wdir}/${wf}${t}"
 # --- knowledge matching -------------------------------------------------------------
 
 # _ctx_path_matches_any <glob> <files-newline-list> — exit 0 when <glob>
-# matches at least one line of <files>.
+# matches at least one line of <files>. jig_path_matches_any (common.sh) is
+# the one matcher this and knowledge.sh both call.
 _ctx_path_matches_any() {
-  local glob="$1" files="$2" pattern file
-  pattern=$(jig_glob_pattern "$glob")
-  while IFS= read -r file; do
-    [ -n "$file" ] || continue
-    # shellcheck disable=SC2254
-    case "$file" in
-      $pattern) return 0 ;;
-    esac
-  done < <(printf '%s\n' "$files")
-  return 1
+  jig_path_matches_any "$1" "$2"
 }
 
 # _ctx_domain_matches_any <domain> <space-separated wanted domains>
@@ -190,12 +183,15 @@ _ctx_domain_matches_any() {
   return 1
 }
 
-# _ctx_doc_reason <doc> <files> <domains> — print "paths: <glob>" or
+# _ctx_doc_reason <doc> <files> <domains> [block] — print "paths: <glob>" or
 # "domains: <domain>" for the first matching entry (frontmatter order,
 # paths checked before domains) and exit 0; exit 1 and print nothing when
-# neither matches.
+# neither matches. Takes the block already read when the caller has one
+# (_ctx_matched_docs), so this and it share one fm_block per document instead
+# of each reading the file again.
 _ctx_doc_reason() {
-  local doc="$1" files="$2" domains="$3" glob dom
+  local doc="$1" files="$2" domains="$3" block="${4-}" glob dom
+  [ $# -ge 4 ] || block=$(fm_block "$doc")
 
   if [ -n "$files" ]; then
     while IFS= read -r glob; do
@@ -204,7 +200,7 @@ _ctx_doc_reason() {
         printf 'paths: %s\n' "$glob"
         return 0
       fi
-    done < <(fm_list "$doc" paths)
+    done < <(fm_list_block "$block" paths)
   fi
 
   if [ -n "$domains" ]; then
@@ -214,7 +210,7 @@ _ctx_doc_reason() {
         printf 'domains: %s\n' "$dom"
         return 0
       fi
-    done < <(fm_list "$doc" domains)
+    done < <(fm_list_block "$block" domains)
   fi
 
   return 1
@@ -232,18 +228,24 @@ _ctx_matched_docs() {
   local t doc status reason relpath out=""
   t=$(printf '\t')
 
+  local block source_doc id
   while IFS= read -r doc; do
     [ -n "$doc" ] || continue
     fm_has "$doc" || continue
+    block=$(fm_block "$doc")
 
     if [ "$show_all" -ne 1 ]; then
-      status=$(fm_get "$doc" status)
+      status=$(fm_get_block "$block" status)
       jig_knowledge_status_resolvable "$status" || continue
     fi
 
-    reason=$(_ctx_doc_reason "$doc" "$files" "$domains") || continue
+    reason=$(_ctx_doc_reason "$doc" "$files" "$domains" "$block") || continue
     relpath=$(_ctx_read_path "$doc") || exit 1
-    [ -z "$(jig_knowledge_source "$doc")" ] || reason="$reason; linked by $(fm_get "$doc" id)"
+    source_doc=$(fm_get_block "$block" source)
+    if [ -n "$source_doc" ]; then
+      id=$(fm_get_block "$block" id)
+      reason="$reason; linked by $id"
+    fi
     out="$out
 ${relpath}${t}${reason}"
   done < <(jig_knowledge_docs)
@@ -311,6 +313,7 @@ _ctx_parse_selectors() {
     # quieter than the command they extend.
     local tc_rc=0 tc_err_file
     tc_err_file=$(mktemp "${TMPDIR:-/tmp}/jig-context-current.XXXXXX")
+    jig_cleanup_add "$tc_err_file"
     CTX_TASK=$(task_current 2>"$tc_err_file") || tc_rc=$?
     if [ "$tc_rc" -eq 2 ]; then cat "$tc_err_file" >&2; fi
     if [ "$tc_rc" -ne 0 ]; then CTX_TASK=""; fi
@@ -375,10 +378,19 @@ _ctx_id_map() {
 # discovery signal, not proof the body is relevant, so it surfaces in the
 # catalog instead. This is the one place the progressive resolver deliberately
 # differs from the stateless form, which keeps promoting a domain match.
+#
+# Reads the document's frontmatter block once (fm_block, one `awk`) and passes
+# it to fm_get_block/fm_list_block for every field below — `load`, `domains`
+# (read up to twice), `paths`, `topics`, `stages` — instead of each of the
+# five going back through fm_get/fm_list and re-reading and re-parsing the
+# same file. This is the loop `_ctx_required_rows` runs once per active
+# document, so the saving is one file read and one block `awk` per document,
+# not per field (knowledge-costs-one-walk task.md).
 _ctx_select_reason() {
-  local doc="$1" load glob dom top
+  local doc="$1" block load glob dom top
+  block=$(fm_block "$doc")
 
-  load=$(fm_get "$doc" load)
+  load=$(fm_get_block "$block" load)
   [ -n "$load" ] || load=matched
 
   if [ "$load" = always ]; then
@@ -386,15 +398,28 @@ _ctx_select_reason() {
     return 0
   fi
 
+  # `load: domain` is the domain OR the files: a document that names files in
+  # `paths` must reach whoever edits them, whether or not they entered the
+  # domain.
   if [ "$load" = domain ]; then
-    [ -n "$CTX_DOMAINS" ] || return 1
-    while IFS= read -r dom; do
-      [ -n "$dom" ] || continue
-      if _ctx_domain_matches_any "$dom" "$CTX_DOMAINS"; then
-        printf 'domains: %s\n' "$dom"
-        return 0
-      fi
-    done < <(fm_list "$doc" domains)
+    if [ -n "$CTX_DOMAINS" ]; then
+      while IFS= read -r dom; do
+        [ -n "$dom" ] || continue
+        if _ctx_domain_matches_any "$dom" "$CTX_DOMAINS"; then
+          printf 'domains: %s\n' "$dom"
+          return 0
+        fi
+      done < <(fm_list_block "$block" domains)
+    fi
+    if [ -n "$CTX_FILES" ]; then
+      while IFS= read -r glob; do
+        [ -n "$glob" ] || continue
+        if _ctx_path_matches_any "$glob" "$CTX_FILES"; then
+          printf 'paths: %s\n' "$glob"
+          return 0
+        fi
+      done < <(fm_list_block "$block" paths)
+    fi
     return 1
   fi
 
@@ -405,7 +430,7 @@ _ctx_select_reason() {
         printf 'paths: %s\n' "$glob"
         return 0
       fi
-    done < <(fm_list "$doc" paths)
+    done < <(fm_list_block "$block" paths)
   fi
 
   if [ -n "$CTX_TOPICS" ]; then
@@ -417,18 +442,18 @@ _ctx_select_reason() {
         printf 'topics: %s\n' "$top"
         return 0
       fi
-    done < <(fm_list "$doc" topics)
+    done < <(fm_list_block "$block" topics)
   fi
 
   if [ -n "$CTX_STAGE" ] && [ -n "$CTX_DOMAINS" ] && [ "$load" = matched ]; then
-    if jig_has_line "$CTX_STAGE" "$(fm_list "$doc" stages)"; then
+    if jig_has_line "$CTX_STAGE" "$(fm_list_block "$block" stages)"; then
       while IFS= read -r dom; do
         [ -n "$dom" ] || continue
         if _ctx_domain_matches_any "$dom" "$CTX_DOMAINS"; then
           printf 'stage: %s; domain: %s\n' "$CTX_STAGE" "$dom"
           return 0
         fi
-      done < <(fm_list "$doc" domains)
+      done < <(fm_list_block "$block" domains)
     fi
   fi
 
@@ -442,12 +467,106 @@ _ctx_listed() {
   JIG_CTX_P="$2" awk -F '\t' '$1 == ENVIRON["JIG_CTX_P"] { f = 1 } END { exit !f }' "$1"
 }
 
+# --- cache between commands in the same checkout ------------------------------
+#
+# `resolve`, `pending` and `guard` are separate processes, each a fresh call to
+# _ctx_required_rows, and a T2 route calls one of them at every stage — the
+# same selectors, against knowledge that has not changed since the stage
+# before. Caching is legitimate here in a way it would not be for the ledger
+# above: the cached answer is exactly what a fresh computation would give,
+# never a stand-in for one.
+#
+# The cache is a fact about one checkout's workspace (ADR-0008: workspace per
+# checkout), so it lives in the task directory alongside the ledger, and two
+# worktrees on two tasks never share or race over it.
+
+# _ctx_cache_file <task> — where the required-rows cache for <task> lives.
+_ctx_cache_file() {
+  printf '%s/context-cache\n' "$(task_dir "$1")"
+}
+
+# _ctx_cache_fingerprint — one block standing for "resolution would come out
+# the same": every selector _ctx_select_reason and the `requires` closure
+# actually read, plus the content of every knowledge document (jig_hash_list,
+# one git process for all of them, not one read per document). A document
+# added or removed changes the file list itself; one rewritten with identical
+# bytes does not — deliberately, so a checkout re-reading the same content
+# after a rebase is not forced to recompute what would resolve unchanged.
+_ctx_cache_fingerprint() {
+  local doclist
+  doclist="${TMPDIR:-/tmp}/jig-context-fp-docs.$$"
+  { while IFS= read -r doc; do
+      [ -n "$doc" ] || continue
+      jig_relpath "$doc" "$JIG_PROJECT"
+    done < <(jig_knowledge_docs)
+  } | LC_ALL=C sort > "$doclist"
+  # rule= names the selection rule itself, so a cache written under an older
+  # rule (load: domain was domain-only) is never served after the rule changed.
+  printf 'rule=domain-or-paths\nstage=%s\nfiles=%s\ndomains=%s\ntopics=%s\nids=%s\nall=%s\n' \
+    "$CTX_STAGE" "$CTX_FILES" "$CTX_DOMAINS" "$CTX_TOPICS" "$CTX_IDS" "$CTX_ALL"
+  jig_hash_list "$JIG_PROJECT" "$doclist"
+  rm -f "$doclist"
+}
+
+# Marks the end of the fingerprint block in a cache file, so the reader knows
+# where selectors and document hashes end and the cached rows begin.
+_CTX_CACHE_MARK='=== rows ==='
+
+# _ctx_cache_read <task> <rows-file> — exit 0 and fill <rows-file> when a
+# cached answer for the current selectors exists and its fingerprint still
+# matches; exit 1 (rows-file untouched) otherwise. Never trusts a cache it has
+# not just re-fingerprinted against the documents on disk.
+_ctx_cache_read() {
+  local task="$1" rows="$2" cache fp cached_fp
+  cache=$(_ctx_cache_file "$task")
+  [ -f "$cache" ] || return 1
+  fp=$(_ctx_cache_fingerprint)
+  cached_fp=$(awk -v m="$_CTX_CACHE_MARK" '$0 == m { exit } { print }' "$cache")
+  [ "$cached_fp" = "$fp" ] || return 1
+  awk -v m="$_CTX_CACHE_MARK" 'found { print } $0 == m { found = 1 }' "$cache" > "$rows"
+  return 0
+}
+
+# _ctx_cache_write <task> <rows-file> — record the rows just computed under
+# the fingerprint that produced them. Through a temporary and `mv`
+# (convention-shell): a reader must never see a half-written cache.
+#
+# A full `if`, not `cmd && mv` (review, knowledge-costs-one-walk): this is the
+# last statement _ctx_required_rows calls before returning, so a failed write
+# — the workspace purged mid-run, a full disk, a permissions slip — must not
+# become that function's own exit status under `set -e` and abort a resolve
+# that had already computed the right rows. A cache is a saved recomputation,
+# never a requirement to have one.
+_ctx_cache_write() {
+  local task="$1" rows="$2" cache tmp
+  # A cache is optional (see above), so a workspace that is not this
+  # repository's own is left unwritten rather than refused: the same check as
+  # every other writer, asked in a subshell so a refusal only skips the cache.
+  ( _task_guard_write "$task" "context" ) >/dev/null 2>&1 || return 0
+  cache=$(_ctx_cache_file "$task")
+  tmp="$cache.tmp.$$"
+  jig_cleanup_add "$tmp"
+  if { _ctx_cache_fingerprint; printf '%s\n' "$_CTX_CACHE_MARK"; cat "$rows"; } > "$tmp"; then
+    mv "$tmp" "$cache"
+  else
+    rm -f "$tmp"
+  fi
+}
+
 # _ctx_required_rows <rows-file> — write "<relpath><TAB><reason>" for every
 # required knowledge document: load policy and selector matches, the ids named
-# with --ids, then the transitive `requires` closure.
+# with --ids, then the transitive `requires` closure. Reuses the cache above
+# when the task, the selectors and the knowledge tree all still agree with the
+# fingerprint that produced it; recomputes and rewrites it otherwise.
 _ctx_required_rows() {
   local rows="$1" t doc reason relpath id idmap
   t=$(printf '\t')
+
+  if [ -n "$CTX_TASK" ] && _ctx_cache_read "$CTX_TASK" "$rows"; then
+    _ctx_check_selected_sources "$rows"
+    return 0
+  fi
+
   : > "$rows"
 
   while IFS= read -r doc; do
@@ -472,6 +591,14 @@ _ctx_required_rows() {
 
   sort -o "$rows" "$rows"
   _ctx_check_selected_sources "$rows"
+
+  # A full `if`, not `[ ... ] && ...`: this is the last statement of the
+  # function, so a short-circuited `&&` would become its return value and,
+  # under `set -e`, fail every taskless call (--no-task, or none active) —
+  # exactly the mistake `_ctx_parse_selectors` warns against above.
+  if [ -n "$CTX_TASK" ]; then
+    _ctx_cache_write "$CTX_TASK" "$rows"
+  fi
 }
 
 # _ctx_read_path <doc> — what the agent reads for <doc> (jig_knowledge_read_path),
@@ -588,16 +715,20 @@ _ctx_global_rows() {
 # 2026-09-18). Metadata only: the agent decides whether to pull one in with
 # --ids, and no body is loaded merely because it is listed.
 _ctx_catalog_rows() {
-  local rows="$1" t doc relpath id summary dom hit readp read_rc doms
+  local rows="$1" t doc block relpath id summary dom hit readp read_rc doms
   t=$(printf '\t')
 
   while IFS= read -r doc; do
     relpath=$(jig_relpath "$doc" "$JIG_PROJECT")
     if _ctx_listed "$rows" "$relpath"; then continue; fi
+    # One fm_block per document: everything below reads this instead of
+    # re-reading and re-parsing $doc for each of domains, paths, id and
+    # summary in turn (knowledge-costs-one-walk task.md).
+    block=$(fm_block "$doc")
     hit=0
-    doms=$(fm_list "$doc" domains)
+    doms=$(fm_list_block "$block" domains)
     if [ -z "$doms" ]; then
-      [ -z "$(fm_list "$doc" paths)" ] && hit=1
+      [ -z "$(fm_list_block "$block" paths)" ] && hit=1
     elif [ -n "$CTX_DOMAINS" ]; then
       while IFS= read -r dom; do
         [ -n "$dom" ] || continue
@@ -607,10 +738,10 @@ $doms
 EOF_DOMS
     fi
     [ "$hit" -eq 1 ] || continue
-    id=$(fm_get "$doc" id)
-    summary=$(fm_get "$doc" summary)
+    id=$(fm_get_block "$block" id)
+    summary=$(fm_get_block "$block" summary)
     [ -n "$summary" ] || summary="(no summary)"
-    if [ -n "$(jig_knowledge_source "$doc")" ]; then
+    if [ -n "$(fm_get_block "$block" source)" ]; then
       read_rc=0
       readp=$(jig_knowledge_read_path "$doc") || read_rc=$?
       if [ "$read_rc" -eq 0 ]; then
@@ -751,6 +882,7 @@ ctx_acknowledge() {
 
   [ -n "$task_id" ] || jig_die "context acknowledge: --task is required"
   [ -f "$(task_dir "$task_id")/state" ] || jig_die "context: unknown task: $task_id"
+  _task_guard_write "$task_id" "context acknowledge"
 
   if [ "$files_stdin" -eq 1 ]; then
     files=$(cat)
@@ -764,6 +896,7 @@ ctx_acknowledge() {
 
   ledger=$(_ctx_ledger_file "$task_id")
   tmp="$ledger.tmp.$$"
+  jig_cleanup_add "$tmp"
 
   # Rewrite through a temporary and `mv` (convention-shell): a crash must not
   # leave a half-written ledger, which would read as "already acknowledged".
@@ -821,6 +954,7 @@ _ctx_pending_paths() {
   paths=$(_ctx_tracked_paths "$rows")
   [ -n "$paths" ] || return 0
   tmp=$(mktemp "${TMPDIR:-/tmp}/jig-context-pending.XXXXXX")
+  jig_cleanup_add "$tmp"
   while IFS= read -r relpath; do
     [ -n "$relpath" ] || continue
     printf '%s\n' "$relpath"

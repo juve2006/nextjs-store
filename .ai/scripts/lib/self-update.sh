@@ -50,8 +50,14 @@ _self_update_branch() {
   # that idiom always captures 0 here, discarding git's real status. `cmd ||
   # rc=$?` captures it before the negation, and the assignment's own success
   # keeps `set -e` from firing on git's failure.
+  #
+  # GIT_TERMINAL_PROMPT=0 and GIT_SSH_COMMAND (jig_git_batch_ssh, common.sh):
+  # self-update is not run by a human watching a terminal for a prompt either
+  # — a remote asking for credentials must fail the pull, not hang it
+  # (fetch-never-waits-for-a-prompt).
   rc=0
-  git -C "$source" pull --ff-only || rc=$?
+  GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(jig_git_batch_ssh)" \
+    git -C "$source" pull --ff-only || rc=$?
   if [ "$rc" -ne 0 ]; then
     printf 'jig: error: self-update: git pull --ff-only failed\n' >&2
     exit "$rc"
@@ -96,8 +102,10 @@ _self_update_detached() {
   current_version=$(jig_release_version "$current_tag")
 
   # See _self_update_branch: `cmd || rc=$?`, never `if ! cmd; then rc=$?`.
+  # Same GIT_TERMINAL_PROMPT=0 / GIT_SSH_COMMAND reasoning as there.
   rc=0
-  git -C "$source" fetch --tags origin || rc=$?
+  GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(jig_git_batch_ssh)" \
+    git -C "$source" fetch --tags origin || rc=$?
   if [ "$rc" -ne 0 ]; then
     printf 'jig: error: self-update: git fetch --tags origin failed\n' >&2
     exit "$rc"

@@ -143,6 +143,7 @@ jig_section_report_state() {
 # is a file the framework cannot rebuild.
 jig_section_write() {
   local file="$1" section="$2" tmp="$1.tmp.$$" crlf=0 first cr
+  jig_cleanup_add "$tmp"
 
   [ "$(jig_section_state "$file")" = ok ] || return 1
 

@@ -14,7 +14,7 @@
 # it lives in these run-scoped globals and in the log.
 _HK_VIA=""          # tier that decided the last remote state: forge|ancestry|none
 _HK_FORGE_KIND=""   # github|gitlab|none — resolved once per run
-_HK_FORGE_PRS=""    # "<head><TAB><base><TAB><state>" lines, fetched once per run (C1)
+_HK_FORGE_PRS=""    # "<head><TAB><base><TAB><state><TAB><head-commit>" lines, fetched once per run (C1)
 _HK_STALE_REMOTE=0  # 1 when the fetch or the forge tier could not answer
 _HK_FORGE_TOKEN=""  # github|gitlab|none|failed — the run marker's forge= field
 _HK_VERBOSE=0       # 1 with --verbose: also print one decision line per task
@@ -24,11 +24,14 @@ _HK_WT_NOTE=""      # ... and as a note in the grouped report
 _HK_BASE_LOG=""     # "<base>\t<ref>\t<epoch>\t<sha>" reflog of every task base's refs, newest first, read once per run
 _HK_WRONG_NOTE=""   # why the last task was flagged wrong-base, as a note in the grouped report
 _HK_DEFAULT_BASE="" # git.base_branch, read once per run
+_HK_LOCK_DIR=""      # the run's own lock directory, once claimed (_hk_lock_acquire); empty otherwise
 
 cmd_housekeeping() {
   jig_require_init
   # shellcheck source=lib/task.sh
   . "$JIG_LIB/task.sh"
+  # shellcheck source=lib/forgecache.sh
+  . "$JIG_LIB/forgecache.sh"
 
   local dry=0
   while [ $# -gt 0 ]; do
@@ -42,7 +45,9 @@ cmd_housekeeping() {
   # The report is printed once every task is decided, grouped by outcome:
   # forty identical lines in id order said nothing a person could act on.
   _HK_ROWS=$(mktemp "${TMPDIR:-/tmp}/jig-housekeeping.XXXXXX")
-  trap 'rm -f "$_HK_ROWS"' EXIT
+  # shellcheck disable=SC2016 # evaluated at exit, by design
+  jig_on_exit '_hk_lock_release "$_HK_LOCK_DIR"'
+  jig_cleanup_add "$_HK_ROWS"
 
   local runtime="$JIG_PROJECT/$JIG_AI_DIR/runtime"
   # Every walk of this path below is `find "$tasks_dir" ...` with no trailing
@@ -65,9 +70,27 @@ cmd_housekeeping() {
   abandoned_ttl_days=$(( $(jig_duration_seconds "$abandoned_ttl") / 86400 ))
   stale_after_days=$(( $(jig_duration_seconds "$stale_after") / 86400 ))
 
+  # Two runs at once help nobody: both would fetch, both would walk
+  # $tasks_dir and both would purge or log the same tasks. A dry run reads
+  # and prints only, so it never contends with anything and takes no lock
+  # (this task, minor point from the review).
+  if [ "$dry" != 1 ]; then
+    mkdir -p "$runtime" 2>/dev/null || true
+    if ! _hk_lock_acquire "$runtime/housekeeping-lock"; then
+      printf 'another housekeeping run holds this clone; skipping\n'
+      return 0
+    fi
+    # A run writes its log line by line and may move workspaces to trash: one
+    # change of the clone, counted once when the run ends, however it ends
+    # (jig_revision_bump, common.sh). Registered before the first write.
+    jig_on_exit 'jig_revision_bump'
+  fi
+
   _HK_DEFAULT_BASE=$(cfg git.base_branch main)
   _hk_fetch "$dry"
+  _hk_check_latest_release "$dry" "$runtime"
   _hk_forge_init
+  [ "$dry" = 1 ] || _hk_forge_cache_write
   _hk_base_reflog_init "$tasks_dir"
 
   # A run boundary in the log. Without it the log is an undifferentiated
@@ -81,7 +104,7 @@ cmd_housekeeping() {
     _hk_log "--- run $(date -u +%Y-%m-%dT%H:%M:%SZ) forge=$_HK_FORGE_TOKEN"
   fi
 
-  local needs_consolidation=0 wrong_base=0 found=0
+  local needs_consolidation=0 wrong_base=0 found=0 keep_branches=""
   local state_file tid st paused age branch base_commit task_base remote remote_pair via landed released decision action flags dest facts wt retire
 
   # Worktrees tasks were started in, from git's own list, read once per run.
@@ -105,6 +128,13 @@ cmd_housekeeping() {
         continue
       fi
       found=1
+
+      # Before anything is read through the workspace or acted on because of it
+      # (a worktree retired, a checkout record kept, a purge): a workspace that
+      # is not this repository's own is refused for the whole run. In this
+      # shell, not in a $(...), so the refusal ends the run. A dry run writes
+      # nothing and is left to report.
+      [ "$dry" = 1 ] || _task_guard_write "$tid" "housekeeping"
 
       st=$(task_state_get "$tid" status)
       paused=$(task_state_get "$tid" paused)
@@ -198,6 +228,17 @@ EOF
         fi
       fi
 
+      # A workspace that stays keeps its branch: ancestry, the epic's final
+      # review and the person still read it. It keeps its base too, which may
+      # be another task's branch (ADR-0026). One the run purged lets its branch
+      # go (_hk_branch_sweep, adr-20261007-a-merged-branch-leaves-with-its-work).
+      if [ "$action" != "purge" ]; then
+        keep_branches="$keep_branches$branch
+$(_hk_task_branch_name "$tid")
+$task_base
+"
+      fi
+
       _hk_report "$dry" "$tid" "$st" "$remote" "$action" "$flags" "$dest" "$facts"
       _hk_record "$tid" "$st" "$remote" "$action" "$flags" "$age" \
         "$abandoned_ttl_days" "$branch" "$base_commit" "$task_base"
@@ -210,6 +251,8 @@ EOF
   _hk_print_report "$dry" "$trash_ttl_days" \
     || jig_warn "housekeeping: could not print the report; the decisions are in .ai/runtime/housekeeping.log"
   [ "$found" = 1 ] || printf 'no task workspaces\n'
+
+  _hk_branch_sweep "$dry" "$keep_branches"
 
   _hk_trash_expire "$dry" "$trash_ttl_days"
 
@@ -402,8 +445,85 @@ _hk_released() {
   printf 'false\n'
 }
 
-# _hk_fetch <dry> — refresh remote refs once per run when allowed. A failure
+# _hk_lock_ttl — how long a claimed lock still counts as live without a
+# reachable pid behind it (the backstop `jig_verify_busy_holder` also uses
+# for `jig verify`, common.sh). A run here does one fetch, one forge call and
+# one walk of the task directory — minutes, not the long test suites verify
+# waits out — so an hour is generous headroom, and there is no
+# `housekeeping.busy_ttl` to configure: this lock is the review's minor
+# point, not a new surface to tune.
+_hk_lock_ttl() { printf '3600\n'; }
+
+# _hk_lock_acquire <dir> — claim the run for this process alone, or say no.
+#
+# Non-blocking, unlike `jig verify`'s busy record: nobody is waiting on
+# housekeeping to finish (it runs detached off the session hook,
+# jig-session-hook), so a run that finds the lock held just skips instead of
+# queuing — whichever run got there first will do the same work either way.
+#
+# `mkdir` is the claim, the one atomic primitive available on POSIX and in
+# Git Bash alike (ADR-0002), the same idiom `_verify_busy_claim` uses in
+# verify.sh — not shared with it, because one command library never sources
+# another (ARCHITECTURE.md); `jig_verify_busy_holder` (common.sh) is shared,
+# and reads the same "checkout: / pid: " shape this writes, so liveness is
+# checked once, in one place. A record whose pid is no longer alive, or that
+# has outlived the ttl, is reclaimed. A directory that plain will not
+# `mkdir` (a read-only clone root, a permission this agent lacks) is not a
+# reason to refuse to run: fail open, exactly as `_verify_busy_acquire` does.
+_hk_lock_acquire() {
+  local dir="$1"
+  # `busy` is the atomic claim; `$dir` itself is only its parent and may be
+  # made ahead of time by anyone, same as `mkdir -p` everywhere else here.
+  mkdir -p "$dir" 2>/dev/null || true
+  if mkdir "$dir/busy" 2>/dev/null; then
+    printf 'checkout: %s\npid: %s\n' "$JIG_PROJECT" "$$" > "$dir/busy/run" 2>/dev/null || true
+    _HK_LOCK_DIR="$dir"
+    return 0
+  fi
+  if [ -d "$dir/busy" ]; then
+    if jig_verify_busy_holder "$dir" "$(_hk_lock_ttl)" >/dev/null 2>&1; then
+      return 1
+    fi
+    rm -f "$dir/busy/run" 2>/dev/null || true
+    rmdir "$dir/busy" 2>/dev/null || true
+  fi
+  if mkdir "$dir/busy" 2>/dev/null; then
+    printf 'checkout: %s\npid: %s\n' "$JIG_PROJECT" "$$" > "$dir/busy/run" 2>/dev/null || true
+    _HK_LOCK_DIR="$dir"
+    return 0
+  fi
+  # Lost the reclaim race to a neighbour, or the filesystem itself refuses:
+  # run anyway rather than refuse (see above).
+  return 0
+}
+
+# _hk_lock_release <dir> — give the record back. Only ever removes the exact
+# path this run built (RULES.md): no `rm -rf` on anything computed elsewhere,
+# and nothing happens for a run that never held the lock (dry runs, or a run
+# that found it already held).
+_hk_lock_release() {
+  local dir="$1"
+  [ -n "$dir" ] || return 0
+  case "$dir" in
+    */"$JIG_AI_DIR"/runtime/housekeeping-lock) ;;
+    *) return 0 ;;
+  esac
+  rm -f "$dir/busy/run" 2>/dev/null || true
+  rmdir "$dir/busy" 2>/dev/null || true
+  return 0
+}
+
+# _hk_fetch <dry> — refresh remote refs once per run when allowed.
+# `--no-prune`, whatever fetch.prune says: an origin/ ref is the upstream
+# `git branch -d` compares a squash-merged branch against, so it stays until
+# the branch sweep has used it (adr-20261007-a-merged-branch-leaves-with-its-work). A failure
 # is not fatal: the run continues on local state and says so (domains/housekeeping).
+#
+# GIT_TERMINAL_PROMPT=0 and GIT_SSH_COMMAND (jig_git_batch_ssh, common.sh):
+# this runs from the session hook, detached and unattended (jig-session-hook)
+# — nobody is at the terminal to answer a credential prompt, so a remote that
+# would ask for one must fail this fetch instead of hanging it forever
+# (fetch-never-waits-for-a-prompt).
 _hk_fetch() {
   local dry="$1"
   if ! cfg_bool housekeeping.fetch true; then
@@ -418,8 +538,52 @@ _hk_fetch() {
   if ! git -C "$JIG_PROJECT" remote get-url origin >/dev/null 2>&1; then
     return 0
   fi
-  if ! git -C "$JIG_PROJECT" fetch --quiet origin >/dev/null 2>&1; then
+  if ! GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(jig_git_batch_ssh)" \
+       git -C "$JIG_PROJECT" fetch --quiet --no-prune origin >/dev/null 2>&1; then
     _HK_STALE_REMOTE=1
+  fi
+  return 0
+}
+
+# _hk_check_latest_release <dry> <runtime> — the newest jig release, written
+# to .ai/runtime/latest-release so `jig status` can name it without a
+# network call of its own (task status-says-a-newer-jig-exists: "человек
+# узнаёт о вышедшей версии jig, не запуская jig doctor"). Doctor already asks
+# this same question of the global framework checkout on demand; this is the
+# unattended, once-a-cadence twin of that check, for the audience that never
+# runs doctor.
+#
+# Gated on housekeeping.fetch exactly like _hk_fetch above (no new config
+# key, per the task's own boundary), and skipped on a dry run for the same
+# reason _hk_fetch is: a dry run reads and prints only. Nothing here can fail
+# the run — a network hiccup is recorded as "failed", honestly, rather than
+# raised (jig_check_newest_release's own contract, common.sh): the file never
+# claims "up to date" without having actually heard so, and `jig status`
+# (_status_latest_release_available) treats "failed" exactly like "no file".
+_hk_check_latest_release() {
+  local dry="$1" runtime="$2" exe root rc best file tmp
+  if ! cfg_bool housekeeping.fetch true; then
+    return 0
+  fi
+  if [ "$dry" = 1 ]; then
+    return 0
+  fi
+  file="$runtime/latest-release"
+  tmp="$file.tmp.$$"
+  jig_cleanup_add "$tmp"
+  mkdir -p "$runtime" 2>/dev/null || return 0
+  if ! exe=$(jig_global_executable); then
+    return 0
+  fi
+  root="${exe%/scripts/jig}"
+  rc=0
+  best=$(jig_check_newest_release "$root" "$_JIG_RELEASE_CHECK_TIMEOUT") || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    printf 'latest=%s\nchecked_at=%s\n' "${best#v}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$tmp" \
+      && mv "$tmp" "$file"
+  else
+    printf 'failed\nchecked_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$tmp" \
+      && mv "$tmp" "$file"
   fi
   return 0
 }
@@ -428,6 +592,11 @@ _hk_fetch() {
 # and pull every pull request in one call (alternatives.md C1). One network
 # call per run, not per task: this command may fire at the start of every
 # agent session.
+#
+# One row per pull request: `<head>\t<base>\t<state>\t<head-commit>`. The
+# fourth column is read only by the branch sweep (_hk_branch_sweep), as the
+# commit a merged branch may be deleted at on origin; a row without it never
+# deletes anything there.
 _hk_forge_init() {
   _HK_FORGE_PRS=""
   _HK_FORGE_KIND=$(jig_forge_kind) || exit 1
@@ -436,14 +605,14 @@ _hk_forge_init() {
   case "$_HK_FORGE_KIND" in
     github)
       _HK_FORGE_PRS=$(gh pr list --state all --limit 200 \
-        --json headRefName,baseRefName,state \
-        --jq '.[] | "\(.headRefName)\t\(.baseRefName)\t\(.state)"' 2>/dev/null || printf '__failed__')
+        --json headRefName,baseRefName,state,headRefOid \
+        --jq '.[] | "\(.headRefName)\t\(.baseRefName)\t\(.state)\t\(.headRefOid)"' 2>/dev/null || printf '__failed__')
       ;;
     gitlab)
       # A row needs a branch and a state; jig_glab_fields (common.sh) splits
       # glab's compact array and drops objects without a source branch.
       _HK_FORGE_PRS=$(glab mr list --all --output json 2>/dev/null \
-        | jig_glab_fields source_branch target_branch state \
+        | jig_glab_fields source_branch target_branch state sha \
         | awk -F '\t' '$3 != ""' \
         || printf '__failed__')
       ;;
@@ -462,6 +631,92 @@ _hk_forge_init() {
   return 0
 }
 
+# _hk_forge_ci — `<head>\t<base>\t<ci>` for every open pull request on GitHub,
+# for the forge cache; nothing on another forge or when gh does not answer.
+#
+# A second list call, asked only when the cache is written. Asked in the first
+# call for all 200, the check rollup made it about six times slower (13 s and
+# 680 KB against 2 s, measured on this repository on 2026-10-15); for the open
+# ones alone it costs about 1 s. A merged or closed pull request's checks are
+# not asked. GitLab's list carries no pipeline, so its CI stays unknown rather
+# than cost a call per merge request.
+#
+# The checks are read into one word the way `task ship` reads them
+# (_jig_ship_checks_github, common.sh, through `gh pr checks`): a check re-run
+# counts once, at its newest run, as gh keeps only that one per workflow and
+# name; a skipped or neutral check counts as neither, a cancelled one as
+# failed, anything unfinished as pending. red, pending, green, or none when no
+# check ran. gh's own --jq, not jq (ADR-0002).
+_hk_forge_ci() {
+  [ "$_HK_FORGE_KIND" = github ] || return 0
+  # shellcheck disable=SC2016 # $c is the --jq expression's variable, not the shell's
+  gh pr list --state open --limit 200 \
+    --json headRefName,baseRefName,statusCheckRollup \
+    --jq '.[] | [.statusCheckRollup // []
+          | group_by((.workflowName // "") + "/" + (.name // .context // ""))[]
+          | max_by(.startedAt // .completedAt // "")
+          | if .__typename == "StatusContext" then
+              (if .state == "SUCCESS" then "pass"
+               elif .state == "ERROR" or .state == "FAILURE" then "fail"
+               else "pending" end)
+            elif .status != "COMPLETED" then "pending"
+            elif .conclusion == "SUCCESS" then "pass"
+            elif .conclusion == "SKIPPED" or .conclusion == "NEUTRAL" then "skip"
+            elif .conclusion == "FAILURE" or .conclusion == "ERROR" or .conclusion == "TIMED_OUT"
+              or .conclusion == "ACTION_REQUIRED" or .conclusion == "CANCELLED" then "fail"
+            else "pending" end] as $c
+        | "\(.headRefName)\t\(.baseRefName)\t\(
+            if any($c[]; . == "fail") then "red"
+            elif any($c[]; . == "pending") then "pending"
+            elif any($c[]; . == "pass") then "green"
+            else "none" end)"' 2>/dev/null || true
+}
+
+# _HK_PR_STATE_AWK — the awk function that reads a forge's word for a pull
+# request's state as open, merged or closed (empty for any other), shared by
+# _hk_forge_state and the forge cache so the two cannot read a state apart.
+_HK_PR_STATE_AWK='
+  function prstate(s) {
+    s = tolower(s)
+    if (s == "opened") return "open"
+    if (s == "locked") return "closed"
+    if (s == "open" || s == "merged" || s == "closed") return s
+    return ""
+  }'
+
+# _hk_forge_cache_write — keep what this run heard from the forge in the forge
+# cache (lib/forgecache.sh) for the reads that never ask it: one line per pull
+# request, `<head>\t<base>\t<state>\t<ci>\t<fetched_at>`, the state normalised
+# as _hk_forge_state normalises it. Only after a list the forge answered: a run
+# without a forge or with a failed one leaves the last cache as it is, every
+# entry still carrying the time it was heard. Never fails the run.
+_hk_forge_cache_write() {
+  local at rows ci
+  case "$_HK_FORGE_KIND" in
+    github | gitlab) ;;
+    *) return 0 ;;
+  esac
+  forgecache_owned || return 0
+  ci=$(_hk_forge_ci)
+  at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  # One stream, each line tagged with the list it came from: the checks first,
+  # so every pull request row can be joined to them in one pass.
+  rows=$({
+    printf '%s\n' "$ci" | awk '$0 != "" { print "C\t" $0 }'
+    printf '%s\n' "$_HK_FORGE_PRS" | awk '$0 != "" { print "P\t" $0 }'
+  } | awk -F '\t' -v at="$at" "$_HK_PR_STATE_AWK"'
+    $1 == "C" { if (NF >= 4 && !(($2 FS $3) in ci)) ci[$2 FS $3] = $4; next }
+    $1 == "P" && NF >= 4 && $2 != "" && $3 != "" {
+      s = prstate($4)
+      if (s == "") next
+      c = "-"
+      if (s == "open" && (($2 FS $3) in ci)) c = ci[$2 FS $3]
+      if (c != "green" && c != "red" && c != "pending" && c != "none") c = "-"
+      print $2 "\t" $3 "\t" s "\t" c "\t" at
+    }') || return 0
+  forgecache_write "$rows"
+}
+
 # _hk_forge_state <branch> <base> — merged|open|closed from the newest pull
 # request of <branch> into <base>; `wrong-base <other>` when there is none but
 # one into another branch was merged; nothing otherwise (fall through to
@@ -469,26 +724,16 @@ _hk_forge_init() {
 # that is how a phase merged into `main` instead of its epic, or stacked on
 # another phase's branch, would read as done (ADR-0039).
 _hk_forge_state() {
-  local branch="$1" base="$2" line raw
+  local branch="$1" base="$2" line
   [ "$_HK_FORGE_KIND" = "none" ] && return 0
   [ -n "$_HK_FORGE_PRS" ] || return 0
 
-  line=$(printf '%s\n' "$_HK_FORGE_PRS" | awk -F'\t' -v b="$branch" -v base="$base" '
-    $1 == b && $2 == base { print $3; found = 1; exit }
-    $1 == b && other == "" && tolower($3) == "merged" { other = $2 }
+  line=$(printf '%s\n' "$_HK_FORGE_PRS" | awk -F'\t' -v b="$branch" -v base="$base" "$_HK_PR_STATE_AWK"'
+    $1 == b && $2 == base { print prstate($3); found = 1; exit }
+    $1 == b && other == "" && prstate($3) == "merged" { other = $2 }
     END { if (!found && other != "") print "wrong-base " other }')
   [ -n "$line" ] || return 0
-  case "$line" in
-    wrong-base\ *) printf '%s\n' "$line"; return 0 ;;
-  esac
-
-  raw=$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')
-  case "$raw" in
-    merged) printf 'merged\n' ;;
-    open|opened) printf 'open\n' ;;
-    closed|locked) printf 'closed\n' ;;
-    *) return 0 ;;
-  esac
+  printf '%s\n' "$line"
 }
 
 # _hk_ancestry_state <branch> <base_commit> <base> — merged|unknown, judged
@@ -730,6 +975,146 @@ _hk_resolve_ref() {
   return 0
 }
 
+# --- merged branches -----------------------------------------------------------
+
+# _hk_task_branch_name <task-id> — the branch git.branch_template names for
+# <task-id>, whether or not it exists; nothing for a template without {id}.
+_hk_task_branch_name() {
+  local template
+  template=$(cfg git.branch_template "task/{id}")
+  case "$template" in
+    *'{id}'*) printf '%s\n' "${template%%'{id}'*}$1${template#*'{id}'}" ;;
+  esac
+}
+
+# _hk_branch_forge_merged <branch> — the head commit of a merged pull request
+# from <branch>, printed (empty when the forge did not say), exit 0; exit 1
+# when the forge knows of none, or of one still open. Merged means into the
+# default branch, or into a branch whose own pull request into the default
+# branch is merged: a phase of an epic that has been released (ADR-0040). A
+# branch with an open pull request is in use, whatever an older one says — as
+# its head, or as the base another one is stacked on.
+_hk_branch_forge_merged() {
+  local b="$1"
+  [ "$_HK_FORGE_KIND" != none ] && [ -n "$_HK_FORGE_PRS" ] || return 1
+  printf '%s\n' "$_HK_FORGE_PRS" | awk -F '\t' -v h="$b" -v d="$_HK_DEFAULT_BASE" '
+    { s = tolower($3) }
+    s == "merged" && $2 == d { released[$1] = 1 }
+    ($1 == h || $2 == h) && (s == "open" || s == "opened") { open = 1 }
+    $1 == h && s == "merged" { n++; base[n] = $2; head[n] = $4 }
+    END {
+      if (open) exit 1
+      for (i = 1; i <= n; i++)
+        if (base[i] == d || released[base[i]]) { print head[i]; exit 0 }
+      exit 1
+    }'
+}
+
+# _hk_branch_sweep <dry> <keep> — delete the branches Jig made whose work has
+# landed and that nothing here still needs (adr-20261007-a-merged-branch-
+# leaves-with-its-work). <keep> lists the branches of the workspaces this run
+# leaves in place, one per line. A candidate is a local branch or an origin/
+# ref that jig_branch_is_jigs (common.sh) calls Jig's, is in <keep> under
+# neither name, and is checked out in no worktree. It has landed when the
+# forge reports its pull request merged (_hk_branch_forge_merged) — the only
+# way a squash merge shows — or when its tip is an ancestor of the default
+# branch. The deleting is jig_branch_leave's, with git's own `-d` first and,
+# past its refusal, only a tip inside the merged pull request's head; origin
+# is touched only with a merged pull request whose head is where origin's
+# branch still is, and an origin/ ref whose branch origin no longer has (one
+# `ls-remote` per run) is dropped after the local branch.
+#
+# Only in the clone's main checkout: a worktree borrows `tasks/`, finds no
+# workspace of its own, and would take every task's branch for an orphan.
+# Off with git.delete_merged_branches: false; nothing remote below agent.git
+# or autopilot.git push, without housekeeping.fetch, on a dry run, or without origin.
+_hk_branch_sweep() {
+  local dry="$1" keep="$2" lvl def_ref remote_ok=0 remote_rights=0 heads="" b tip sha merged landed have_local have_track rsha line
+  cfg_bool git.delete_merged_branches true || return 0
+  [ "$(jig_config_clone_root)" = "$JIG_PROJECT" ] || return 0
+  def_ref=$(jig_base_ref "$_HK_DEFAULT_BASE")
+  [ -n "$def_ref" ] || return 0
+  # origin is shared: housekeeping writes to it only for a person whose own
+  # agent may push (agent.git or autopilot.git at push or above, local-only
+  # keys), the same right `task ship` needs to put the branch there in the
+  # first place; a run that pushed under autopilot.git leaves a branch behind
+  # that agent.git alone would never sweep.
+  for lvl in "$(jig_agent_git 2>/dev/null || true)" "$(cfg autopilot.git "" 2>/dev/null || true)"; do
+    case "$lvl" in
+      push | pr | merge) remote_rights=1 ;;
+    esac
+  done
+  if [ "$dry" != 1 ] && [ "$remote_rights" = 1 ] && cfg_bool housekeeping.fetch true \
+     && git -C "$JIG_PROJECT" remote get-url origin >/dev/null 2>&1; then
+    if heads=$(GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(jig_git_batch_ssh)" \
+         git -C "$JIG_PROJECT" ls-remote --heads origin 2>/dev/null); then
+      remote_ok=1
+    fi
+  fi
+  while IFS= read -r b; do
+    [ -n "$b" ] || continue
+    jig_branch_is_jigs "$b" || continue
+    ! jig_has_line "$b" "$keep" || continue
+    ! jig_branch_checked_out "$b" || continue
+    landed=0
+    if sha=$(_hk_branch_forge_merged "$b"); then
+      landed=1
+    else
+      sha=""
+      tip=$(_hk_resolve_ref "$b")
+      if [ -n "$tip" ] && git -C "$JIG_PROJECT" merge-base --is-ancestor "$tip" "$def_ref" 2>/dev/null; then
+        landed=1
+      fi
+    fi
+    [ "$landed" = 1 ] || continue
+    have_local=0
+    have_track=0
+    git -C "$JIG_PROJECT" show-ref --verify --quiet "refs/heads/$b" && have_local=1
+    git -C "$JIG_PROJECT" show-ref --verify --quiet "refs/remotes/origin/$b" && have_track=1
+    if [ "$dry" = 1 ]; then
+      [ "$have_local" = 0 ] || printf 'would delete branch %s\n' "$b"
+      if [ -n "$sha" ] && [ "$have_track" = 1 ] && [ "$remote_rights" = 1 ] \
+         && cfg_bool housekeeping.fetch true; then
+        printf 'would delete branch %s on origin, if it is still at the merged commit\n' "$b"
+      fi
+      continue
+    fi
+    # origin is asked only with a merged pull request, and only at the commit
+    # origin's branch is still at: ls-remote's answer, not the local ref's.
+    rsha=""
+    if [ "$remote_ok" = 1 ]; then
+      rsha=$(printf '%s\n' "$heads" | awk -v r="refs/heads/$b" '$2 == r { print $1; exit }')
+    fi
+    # The merged head still vouches for the local branch when origin's copy
+    # is gone or moved: its upstream ref may be gone with it, and then `-d`
+    # alone refuses a squash-merged branch.
+    merged="$sha"
+    if [ -z "$sha" ] || [ -z "$rsha" ] || [ "$sha" != "$rsha" ]; then
+      sha=""
+    fi
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      printf '%s\n' "$line"
+      case "$line" in
+        *": deleted branch $b on origin") _hk_log "$(date -u +%Y-%m-%dT%H:%M:%SZ) branch=$b where=origin action=delete" ;;
+        *": deleted branch $b") _hk_log "$(date -u +%Y-%m-%dT%H:%M:%SZ) branch=$b where=local action=delete" ;;
+        *": kept branch $b on origin"*) _hk_log "$(date -u +%Y-%m-%dT%H:%M:%SZ) branch=$b where=origin action=keep" ;;
+        *": kept branch $b"*) _hk_log "$(date -u +%Y-%m-%dT%H:%M:%SZ) branch=$b where=local action=keep" ;;
+      esac
+    done < <(jig_branch_leave housekeeping "$b" "$sha" "$merged")
+    # A cache of a branch origin no longer has, dropped once the local branch
+    # is gone (it was what `-d` compared that branch against).
+    if [ "$remote_ok" = 1 ] && [ "$have_track" = 1 ] && [ -z "$rsha" ] \
+       && ! git -C "$JIG_PROJECT" show-ref --verify --quiet "refs/heads/$b"; then
+      git -C "$JIG_PROJECT" branch -q -d -r "origin/$b" >/dev/null 2>&1 || true
+    fi
+  done < <( {
+      git -C "$JIG_PROJECT" for-each-ref --format='%(refname:strip=2)' refs/heads/ 2>/dev/null
+      git -C "$JIG_PROJECT" for-each-ref --format='%(refname:strip=3)' refs/remotes/origin/ 2>/dev/null
+    } | grep -vx 'HEAD' | LC_ALL=C sort -u)
+  return 0
+}
+
 # --- purge -------------------------------------------------------------------
 
 # _hk_trash_dest <task-id> — the trash path this task would be moved to,
@@ -890,7 +1275,11 @@ _hk_worktree_retire() {
 # _hk_worktree_ignored <path> — the paths `git worktree remove` would delete
 # without a word: what the project ignores, as git reports it, one per line and
 # relative to the worktree. Whole ignored directories come back as one entry,
-# so a tree full of dependencies is a handful of lines, not thousands. `-z`
+# so a tree full of dependencies is a handful of lines, not thousands — but only
+# in the `normal` untracked mode, so it is asked for by name. A person's own
+# `status.showUntrackedFiles=all` otherwise lists every file inside them: 43 621
+# lines for one worktree with vendor/ and node_modules/ (measured, 2026-10-16),
+# and a find for each in _hk_worktree_unshared. `-z`
 # spares the quoting git otherwise puts around a path with a space, a quote or a
 # byte above ASCII in it — measured: without `-z` those come back as
 # `"with space/"` and no `[ -e ]` finds them again. The NUL stays inside the
@@ -902,7 +1291,7 @@ _hk_worktree_retire() {
 # pipeline carry git's failure out, and the caller reads that as an uncertainty,
 # never as "nothing is ignored".
 _hk_worktree_ignored() {
-  git -C "$1" status --porcelain -z --ignored 2>/dev/null \
+  git -C "$1" status --porcelain -z --ignored --untracked-files=normal 2>/dev/null \
     | tr '\0' '\n' \
     | sed -n 's/^!! //p'
 }
@@ -955,22 +1344,40 @@ _hk_repo_holds_work() {
 # nor a link inside one is followed — .ai/workspace/tasks is itself the link
 # that borrows another checkout's workspaces (the fallback shape holds one link
 # per task under it instead), and it leads into another checkout entirely.
+#
+# Ignored files are listed one by one even in the normal mode (*.pyc beside
+# the sources), so the walk stays cheap per entry: a file other than a `.git`
+# of its own holds no repository and gets no find, and find's answer is read
+# from a here-document, not a process substitution — bash 3.2 keeps every
+# process substitution opened in a loop until the function returns, one
+# descriptor per ignored path (measured; on 2026-10-16 that ran the system's
+# file table out).
 _hk_worktree_unshared() {
-  local path="$1" list="$2" rel dot repo
+  local path="$1" list="$2" rel dot dots repo
   while IFS= read -r rel; do
     # git marks a directory with a trailing slash; find implementations differ
     # on whether they double it into the paths they print.
     rel=${rel%/}
     [ -n "$rel" ] || continue
     [ -e "$path/$rel" ] || continue
+    case "/$rel" in
+      */.git) ;;
+      *) [ -d "$path/$rel" ] || continue ;;
+    esac
+    dots=$(find "$path/$rel" -name .git -prune -print 2>/dev/null) || true
+    [ -n "$dots" ] || continue
     while IFS= read -r dot; do
       repo=${dot%/.git}
       [ "$repo" != "$dot" ] || continue
       _hk_repo_holds_work "$repo" || continue
       printf '%s\n' "$repo"
       return 0
-    done < <(find "$path/$rel" -name .git -prune -print 2>/dev/null)
-  done < <(printf '%s\n' "$list")
+    done <<EOF
+$dots
+EOF
+  done <<EOF
+$list
+EOF
   return 1
 }
 

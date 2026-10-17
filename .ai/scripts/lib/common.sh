@@ -10,12 +10,129 @@ export JIG_AI_DIR
 jig_log()  { [ -n "${JIG_QUIET:-}" ] || printf '%s\n' "$*"; }
 jig_info() { [ -n "${JIG_QUIET:-}" ] || printf 'jig: %s\n' "$*" >&2; }
 jig_warn() { printf 'jig: warning: %s\n' "$*" >&2; }
-jig_die()  {
+jig_die()  { _jig_die_as failed "$@"; }
+
+# jig_fail <code> <message...> — jig_die, naming the stable failure code a
+# program reads from a `--json` refusal's `error.code` (schemas/json.md, "Failure
+# codes"). The person reads the same `jig: error: <message>` either way; a
+# refusal that names no code is `failed`.
+jig_fail() {
+  local code="$1"
+  shift
+  _jig_die_as "$code" "$@"
+}
+
+# Inside a `--json` producer (json_run sets _JIG_JSON_CODES there, never
+# exported) the code goes on the line just before the message, behind a unit
+# separator: the two travel and vanish together — a `2>/dev/null` swallows
+# both — so json_run always pairs the message it reports with its own code,
+# and strips the marker before stderr reaches a person.
+_jig_die_as() {
+  [ -z "${_JIG_JSON_CODES:-}" ] || printf '\037jig: code: %s\n' "$1" >&2
+  shift
   printf 'jig: error: %s\n' "$*" >&2
   # A command that changed a task and then failed still redraws the status
   # page, so the page never shows less than the files do.
   jig_status_page_flush
   exit 1
+}
+
+# --- cleanup that outlives the function that asked for it ---------------------
+#
+# One accumulating EXIT/INT/TERM mechanism for the whole process. A `trap` is one
+# slot: libraries sourced into one process that each set their own replace one
+# another, and a library that sets none leaves its temporary files behind when
+# the command is interrupted. Everything that must go when the command ends goes
+# through here instead:
+#
+#   jig_cleanup_add [-d] <path>   remove <path> (a directory with -d) at exit
+#   jig_on_exit '<command>'       run <command> (single-quoted, evaluated at exit)
+#
+# Both may be called any number of times, from any library, in any order; actions
+# run first, in the order given, then the paths. Registering a path that is gone
+# by then (the `mv` already published it) is harmless, and registering the same
+# path twice is a no-op, so a loop that rewrites one file does not grow the list.
+# SIGINT and SIGTERM exit with 130 and 143, which runs the EXIT handler: the
+# command ends there instead of carrying on after its cleanup.
+#
+# Call it from the main shell, not from `$(...)`: a subshell that registers starts
+# a list of its own (BASH_SUBSHELL differs from the one that built the parent's)
+# and never removes what its parent registered. It does not promise more: bash 3.2
+# skips the EXIT trap of a `$(...)` that simply runs off its end, so a temporary
+# made there is cleaned only by an `exit` or a signal. SIGKILL cannot be trapped;
+# what it leaves is the price of a signal nothing can catch.
+_JIG_EXIT_ACTIONS=""
+_JIG_EXIT_FILES=""
+_JIG_EXIT_DIRS=""
+_JIG_EXIT_LEVEL=""
+
+# _jig_exit_arm — own the traps for the current shell level, once.
+_jig_exit_arm() {
+  local level="${BASH_SUBSHELL:-0}"
+  [ "$_JIG_EXIT_LEVEL" != "$level" ] || return 0
+  _JIG_EXIT_ACTIONS=""
+  _JIG_EXIT_FILES=""
+  _JIG_EXIT_DIRS=""
+  _JIG_EXIT_LEVEL="$level"
+  trap '_jig_exit_run' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
+jig_on_exit() {
+  _jig_exit_arm
+  case "$_JIG_EXIT_ACTIONS" in
+    *"
+$1
+"*) return 0 ;;
+  esac
+  _JIG_EXIT_ACTIONS="$_JIG_EXIT_ACTIONS
+$1
+"
+}
+
+jig_cleanup_add() {
+  local dir=0 p
+  if [ "${1:-}" = "-d" ]; then dir=1; shift; fi
+  p="${1:-}"
+  [ -n "$p" ] || return 0
+  _jig_exit_arm
+  if [ "$dir" = 1 ]; then
+    case "$_JIG_EXIT_DIRS" in *"
+$p
+"*) return 0 ;; esac
+    _JIG_EXIT_DIRS="$_JIG_EXIT_DIRS
+$p
+"
+  else
+    case "$_JIG_EXIT_FILES" in *"
+$p
+"*) return 0 ;; esac
+    _JIG_EXIT_FILES="$_JIG_EXIT_FILES
+$p
+"
+  fi
+}
+
+_jig_exit_run() {
+  [ "$_JIG_EXIT_LEVEL" = "${BASH_SUBSHELL:-0}" ] || return 0
+  local line
+  while IFS= read -r line; do
+    [ -z "$line" ] || eval "$line" || true
+  done <<EOF_ACTIONS
+$_JIG_EXIT_ACTIONS
+EOF_ACTIONS
+  while IFS= read -r line; do
+    [ -z "$line" ] || rm -f -- "$line" 2>/dev/null || true
+  done <<EOF_FILES
+$_JIG_EXIT_FILES
+EOF_FILES
+  while IFS= read -r line; do
+    [ -z "$line" ] || rm -rf -- "$line" 2>/dev/null || true
+  done <<EOF_DIRS
+$_JIG_EXIT_DIRS
+EOF_DIRS
+  return 0
 }
 
 # --- repository ------------------------------------------------------------
@@ -86,7 +203,7 @@ jig_repo_root() {
 jig_require_repo() {
   local top
   jig_clear_git_location_env
-  top=$(jig_repo_root) || jig_die "not inside a git repository"
+  top=$(jig_repo_root) || jig_fail not-a-repository "not inside a git repository"
   JIG_PROJECT=$(cd -P "$top" 2>/dev/null && pwd -P) \
     || jig_die "cannot resolve the repository root: $top"
   export JIG_PROJECT
@@ -123,7 +240,7 @@ jig_has_line() {
 jig_require_init() {
   jig_require_repo
   [ -f "$JIG_PROJECT/$JIG_AI_DIR/config.yaml" ] \
-    || jig_die "project is not initialised; run: jig init"
+    || jig_fail not-initialised "project is not initialised; run: jig init"
 }
 
 # True when <dir> is a framework source checkout (has skills/ and templates/).
@@ -294,6 +411,7 @@ jig_link_detect() {
   local dir
   _JIG_LINK_KIND=none
   dir=$(mktemp -d "${TMPDIR:-/tmp}/jig-link-probe.XXXXXX") || return 0
+  jig_cleanup_add -d "$dir"
   mkdir "$dir/target" || { rm -rf "$dir"; return 0; }
   if ln -s "$dir/target" "$dir/symlink" 2>/dev/null && [ -L "$dir/symlink" ]; then
     _JIG_LINK_KIND=symlink
@@ -357,6 +475,7 @@ jig_copy_detect() {
   _JIG_COPY_FLAGS="-a"
   _JIG_COPY_KIND="copy"
   dir=$(mktemp -d "${TMPDIR:-/tmp}/jig-copy-probe.XXXXXX") || return 0
+  jig_cleanup_add -d "$dir"
   if printf 'x\n' > "$dir/probe" 2>/dev/null; then
     if cp -c "$dir/probe" "$dir/clone" >/dev/null 2>&1; then
       _JIG_COPY_FLAGS="-a -c"
@@ -481,19 +600,122 @@ jig_fresh_base_ref() {
   fi
 }
 
+# jig_git_batch_ssh — the value for GIT_SSH_COMMAND that adds `-o
+# BatchMode=yes` on top of whatever SSH command the environment already
+# names (plain `ssh` when nothing does), so an `ssh://` or `git@` remote
+# fails a password/passphrase prompt instead of waiting for it. Paired with
+# `GIT_TERMINAL_PROMPT=0`, which does the same for git's own credential
+# helper (HTTPS remotes): together they cover every interactive-credential
+# path git has, on every network call that must never sit waiting for input
+# nobody will type (this task).
+#
+# Not a timeout. Neither this nor GIT_TERMINAL_PROMPT=0 bounds a call that
+# hangs for a different reason — a stalled TCP connection, a slow forge.
+# That would need a process-level timeout, and `timeout`/`gtimeout` is not
+# guaranteed to exist (ADR-0002: git is the only required dependency), so
+# none is added here; a caller cannot be made to wait no longer than N
+# seconds without one.
+jig_git_batch_ssh() {
+  printf '%s -o BatchMode=yes\n' "${GIT_SSH_COMMAND:-ssh}"
+}
+
+# --- the newest published release -------------------------------------------
+#
+# Doctor (`jig doctor`) and housekeeping's daily release check both ask the
+# same question of a framework checkout's origin — "what is the newest
+# release tag?" — and both must never hang or prompt for a credential doing
+# it. One implementation, shared here, rather than two that could drift
+# (task status-says-a-newer-jig-exists, following on #146
+# doctor-says-a-newer-jig-exists, which first wrote this against doctor
+# alone).
+
+# _JIG_RELEASE_CHECK_TIMEOUT — seconds a caller budgets `jig_check_newest_release`
+# for `git ls-remote` to answer before it is killed. One shared number, so
+# doctor and housekeeping never quietly drift apart on how long "too slow"
+# is.
+_JIG_RELEASE_CHECK_TIMEOUT=5
+
+# jig_ls_remote_tags <root> <seconds> — `git ls-remote --tags origin` at the
+# checkout <root>, printed on success. Killed and reported failed (exit 2) if
+# it is still running after <seconds> wall-clock seconds; a plain git failure
+# (bad or unreachable origin, answered quickly) is exit 1, so the caller can
+# tell "no answer in time" from "an answer arrived, and it was no" apart,
+# rather than reporting both as the same shrug.
+#
+# GIT_TERMINAL_PROMPT=0 and GIT_SSH_COMMAND (jig_git_batch_ssh above) keep a
+# credential prompt from hanging the call.
+#
+# Rolled by hand rather than `timeout`/`gtimeout` (not guaranteed to exist,
+# ADR-0002): the call runs in the background, this polls `kill -0` five times
+# a second, and sends SIGTERM once the budget is spent. A killed call never
+# hands back partial tag data — the temp file is discarded either way.
+jig_ls_remote_tags() {
+  local root="$1" seconds="$2" out pid ticks=0 max_ticks
+  max_ticks=$((seconds * 5))
+  out=$(mktemp "${TMPDIR:-/tmp}/jig-lsremote.XXXXXX") || return 1
+  jig_cleanup_add "$out"
+  GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(jig_git_batch_ssh)" \
+    git -C "$root" ls-remote --tags origin >"$out" 2>/dev/null &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$ticks" -ge "$max_ticks" ]; then
+      kill "$pid" 2>/dev/null
+      wait "$pid" 2>/dev/null
+      rm -f "$out"
+      return 2
+    fi
+    sleep 0.2
+    ticks=$((ticks + 1))
+  done
+  if wait "$pid"; then
+    cat "$out"
+    rm -f "$out"
+    return 0
+  fi
+  rm -f "$out"
+  return 1
+}
+
+# jig_check_newest_release <root> [seconds] — the newest release tag
+# (`vX.Y.Z`) published at <root>'s origin remote, printed on success
+# (<seconds> defaults to _JIG_RELEASE_CHECK_TIMEOUT). Read-only and
+# network-bound like jig_ls_remote_tags above, which it calls.
+#
+# Failure is never folded into one shrug: the exit code says which of four
+# distinct things happened, so a caller can report (or not) accordingly
+# (ADR-0017, "unknown is not zero"):
+#   1 — no origin remote at <root>
+#   2 — origin answered, but `git ls-remote` failed (e.g. it does not exist)
+#   3 — origin did not answer within <seconds>
+#   4 — origin has no release tag
+jig_check_newest_release() {
+  local root="$1" seconds="${2:-$_JIG_RELEASE_CHECK_TIMEOUT}" out rc best
+  git -C "$root" remote get-url origin >/dev/null 2>&1 || return 1
+  rc=0
+  out=$(jig_ls_remote_tags "$root" "$seconds") || rc=$?
+  if [ "$rc" -eq 2 ]; then
+    return 3
+  elif [ "$rc" -ne 0 ]; then
+    return 2
+  fi
+  best=$(printf '%s\n' "$out" | jig_newest_release) || return 4
+  printf '%s\n' "$best"
+}
+
 # jig_fetch_branches <who> <name>... — refresh origin/<name> for each branch
 # from origin, one at a time, so that a branch origin does not have fails
 # alone. Does nothing without an origin. A failure is a warning, never fatal:
 # the caller goes on with the refs it has, and says what it decided from them.
-# GIT_TERMINAL_PROMPT=0: a command that only wanted fresh refs must not stop
-# and wait for a password.
+# GIT_TERMINAL_PROMPT=0 and GIT_SSH_COMMAND (jig_git_batch_ssh): a command
+# that only wanted fresh refs must not stop and wait for a password.
 jig_fetch_branches() {
   local who="$1" name
   shift
   git -C "$JIG_PROJECT" remote get-url origin >/dev/null 2>&1 || return 0
   for name in "$@"; do
     [ -n "$name" ] || continue
-    if ! GIT_TERMINAL_PROMPT=0 git -C "$JIG_PROJECT" fetch --quiet origin \
+    if ! GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(jig_git_batch_ssh)" \
+         git -C "$JIG_PROJECT" fetch --quiet origin \
          "+refs/heads/$name:refs/remotes/origin/$name" >/dev/null 2>&1; then
       jig_warn "$who: could not fetch $name from origin; using the refs this checkout has"
     fi
@@ -736,11 +958,13 @@ jig_ship_sends_no_commit() {
 
 # jig_ship_push <who> <branch> — push <branch> to origin and track it. Never
 # --force: a branch origin has moved past is refused by git, and the refusal
-# is the answer.
+# is the answer. GIT_TERMINAL_PROMPT=0 and GIT_SSH_COMMAND (jig_git_batch_ssh):
+# shipping is not a place to sit waiting for a credential prompt either.
 jig_ship_push() {
   local who="$1" branch="$2" out
   _jig_ship_outward "$who"
-  if ! out=$(git -C "$JIG_PROJECT" push -u origin "$branch" 2>&1); then
+  if ! out=$(GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(jig_git_batch_ssh)" \
+             git -C "$JIG_PROJECT" push -u origin "$branch" 2>&1); then
     jig_die "$who: git push failed:
 $out"
   fi
@@ -767,7 +991,7 @@ jig_ship_pr() {
   [ -n "$title" ] || title=$(head -n 1 "$message_file")
   if [ -z "$body_file" ]; then
     _JIG_SHIP_BODY_TMP=$(mktemp "${TMPDIR:-/tmp}/jig-ship-body.XXXXXX")
-    trap '[ -z "${_JIG_SHIP_BODY_TMP:-}" ] || rm -f "$_JIG_SHIP_BODY_TMP"' EXIT
+    jig_cleanup_add "$_JIG_SHIP_BODY_TMP"
     tail -n +2 "$message_file" > "$_JIG_SHIP_BODY_TMP"
     body_file="$_JIG_SHIP_BODY_TMP"
   fi
@@ -1103,6 +1327,227 @@ _jig_ship_merge_gitlab() {
   printf 'merged %s\n' "$url"
 }
 
+# jig_pr_state <url> — merged|open|closed|unknown for the pull/merge request at
+# <url>, read live from whichever forge this checkout uses. `unknown` is the
+# safe answer whenever the state cannot be confirmed: no forge configured, the
+# read fails, or the forge reports something this checkout does not recognise
+# — a caller deciding whether work has landed must never read `unknown` as
+# `merged` (autopilot-end-closes-unmerged-task; ADR-0005 keeps merge state out
+# of `state` for the same reason: it is asked for, never trusted from disk).
+#
+# Shared rather than kept in task.sh: `task set status consolidated` and
+# housekeeping's remote-state tier both have to ask the same question of the
+# same forge, and one command library never sources another (ARCHITECTURE.md,
+# Scripts layout).
+jig_pr_state() {
+  local url="$1" kind
+  [ -n "$url" ] || { printf 'unknown\n'; return 0; }
+  kind=$(jig_forge_kind) || exit 1
+  case "$kind" in
+    github) _jig_pr_state_github "$url" ;;
+    gitlab) _jig_pr_state_gitlab "$url" ;;
+    *) printf 'unknown\n' ;;
+  esac
+}
+
+_jig_pr_state_github() {
+  local state
+  state=$(gh pr view "$1" --json state --jq .state 2>/dev/null) || { printf 'unknown\n'; return 0; }
+  case "$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')" in
+    merged) printf 'merged\n' ;;
+    open) printf 'open\n' ;;
+    closed) printf 'closed\n' ;;
+    *) printf 'unknown\n' ;;
+  esac
+}
+
+_jig_pr_state_gitlab() {
+  local iid json state
+  iid=$(_jig_ship_glab_mr "$1")
+  [ -n "$iid" ] || { printf 'unknown\n'; return 0; }
+  json=$(glab mr view "$iid" --output json 2>/dev/null) || { printf 'unknown\n'; return 0; }
+  state=$(printf '%s' "$json" | tr -d ' \n' | sed -n 's/.*"state":"\([^"]*\)".*/\1/p')
+  case "$state" in
+    merged) printf 'merged\n' ;;
+    opened) printf 'open\n' ;;
+    closed) printf 'closed\n' ;;
+    *) printf 'unknown\n' ;;
+  esac
+}
+
+# --- merged branches ---------------------------------------------------------
+#
+# A branch whose work has landed leaves with it
+# (adr-20261007-a-merged-branch-leaves-with-its-work): right after a merge Jig
+# made itself (jig_ship_leave), and in housekeeping once the task it belonged
+# to is purged (_hk_branch_sweep). This is the one place a branch is deleted,
+# and git does the deleting: `git branch -d` first, so git itself refuses a
+# branch whose commits are on neither its upstream nor HEAD; past a refusal
+# only a branch whose tip is in the head of a pull request the forge reported
+# merged, by a ref update guarded by that tip
+# (adr-20261010-a-gone-upstream-defers-to-the-merged-head); and on origin a
+# push with a lease at the merged commit, so a branch somebody pushed to after
+# the merge stays. RULES.md names this site in its deletion paragraph.
+
+# jig_branch_is_jigs <branch> — exit 0 when <branch> is a name Jig gives its
+# own branches: `jig/upgrade-*` (jig upgrade), `finish/<id>` (spec ship's
+# finish) or the name `git.branch_template` gives a valid task id. A template
+# with no literal text before `{id}` names no branch as Jig's: every branch
+# whose name is a valid id would match it. Never an epic (`epic/*`, ADR-0040)
+# or a spec branch (`spec/*`): those are the bases tasks are judged against,
+# and never the project's base branch, whatever it is called.
+jig_branch_is_jigs() {
+  local b="$1" template prefix suffix mid
+  [ -n "$b" ] || return 1
+  [ "$b" != "$(cfg git.base_branch main)" ] || return 1
+  case "$b" in
+    epic/* | spec/*) return 1 ;;
+    jig/upgrade-?*) return 0 ;;
+    finish/*) jig_valid_id "${b#finish/}"; return ;;
+  esac
+  template=$(cfg git.branch_template "task/{id}")
+  case "$template" in
+    *'{id}'*) ;;
+    *) return 1 ;;
+  esac
+  prefix=${template%%'{id}'*}
+  suffix=${template#*'{id}'}
+  [ -n "$prefix" ] || return 1
+  case "$b" in
+    "$prefix"*"$suffix") ;;
+    *) return 1 ;;
+  esac
+  mid=${b#"$prefix"}
+  mid=${mid%"$suffix"}
+  jig_valid_id "$mid"
+}
+
+# jig_branch_checked_out <branch> — exit 0 when <branch> is checked out in any
+# worktree of this clone, this checkout included; also when git cannot list
+# them: an unanswered question keeps the branch.
+jig_branch_checked_out() {
+  local list
+  list=$(git -C "$JIG_PROJECT" worktree list --porcelain 2>/dev/null) || return 0
+  jig_has_line "branch refs/heads/$1" "$list"
+}
+
+# jig_branch_leave <who> <branch> <remote-sha> [<merged-head>] — delete
+# <branch> here, then on origin, and say so; or keep it and say why.
+# <remote-sha> is the head of the pull request the forge reported merged, or
+# empty: without one, origin is never touched. <merged-head> is that head again
+# for the local branch alone (default: <remote-sha>); housekeeping passes it
+# when origin no longer has the branch and <remote-sha> is therefore empty.
+# One line per outcome, prefixed with <who>:
+#   deleted branch <b> | deleted branch <b> on origin | kept branch <b>: <why>
+#
+# The order is the safety. The local branch goes first, while origin/<b> — its
+# upstream, at the commit that was pushed — still exists: `git branch -d`
+# checks a branch against its upstream when it has one, so a squash-merged
+# branch passes, and a branch with a commit origin never saw is refused. A
+# refusal keeps origin's copy too. Only then origin: `--force-with-lease` at
+# <remote-sha> deletes the branch only while it is still at the commit the
+# forge merged. When the forge already deleted it (GitHub's "automatically
+# delete head branches"), the lease fails; `ls-remote` confirms the branch is
+# gone, and only then the stale origin/<b> is dropped — a cache, not work.
+#
+# When origin/<b> is already gone — somebody else's `fetch --prune` took it
+# after the forge deleted the branch — `-d` compares with HEAD and refuses a
+# squash-merged branch. Then, and only with <merged-head>, a branch whose tip
+# is that head or an ancestor of it goes anyway: every commit on it is in the
+# pull request that was merged. `update-ref -d` with the tip as the old value
+# deletes it only while it is still there; a tip with a commit past the head
+# is kept.
+#
+# Off with `git.delete_merged_branches: false`. Returns 0 always: keeping a
+# branch is an outcome, never a failure of the command that called this.
+jig_branch_leave() {
+  local who="$1" b="$2" sha="$3" merged="${4-$3}" ssh out tip
+  cfg_bool git.delete_merged_branches true || return 0
+  jig_branch_is_jigs "$b" || return 0
+  if jig_branch_checked_out "$b"; then
+    printf '%s: kept branch %s: it is checked out in a worktree\n' "$who" "$b"
+    return 0
+  fi
+  if git -C "$JIG_PROJECT" show-ref --verify --quiet "refs/heads/$b"; then
+    if ! git -C "$JIG_PROJECT" branch -q -d "$b" >/dev/null 2>&1; then
+      tip=$(git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/heads/$b^{commit}" 2>/dev/null || true)
+      case "$merged" in
+        *[!0-9a-f]*) merged="" ;;
+      esac
+      # `-d` refuses a checked-out branch; update-ref would not, so ask again.
+      if [ -z "$merged" ] || [ -z "$tip" ] || jig_branch_checked_out "$b" \
+         || ! git -C "$JIG_PROJECT" merge-base --is-ancestor "$tip" "$merged" >/dev/null 2>&1 \
+         || ! git -C "$JIG_PROJECT" update-ref -d "refs/heads/$b" "$tip" >/dev/null 2>&1; then
+        printf '%s: kept branch %s: git does not see all of its commits merged\n' "$who" "$b"
+        return 0
+      fi
+      git -C "$JIG_PROJECT" config --remove-section "branch.$b" >/dev/null 2>&1 || true
+    fi
+    printf '%s: deleted branch %s\n' "$who" "$b"
+  fi
+  [ -n "$sha" ] || return 0
+  git -C "$JIG_PROJECT" remote get-url origin >/dev/null 2>&1 || return 0
+  ssh=$(jig_git_batch_ssh)
+  if GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$ssh" git -C "$JIG_PROJECT" push --quiet \
+       "--force-with-lease=refs/heads/$b:$sha" origin ":refs/heads/$b" >/dev/null 2>&1; then
+    printf '%s: deleted branch %s on origin\n' "$who" "$b"
+    return 0
+  fi
+  if out=$(GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$ssh" \
+       git -C "$JIG_PROJECT" ls-remote --heads origin "refs/heads/$b" 2>/dev/null) && [ -z "$out" ]; then
+    git -C "$JIG_PROJECT" branch -q -d -r "origin/$b" >/dev/null 2>&1 || true
+    return 0
+  fi
+  printf '%s: kept branch %s on origin: it is no longer at the merged commit, or origin refused\n' "$who" "$b"
+  return 0
+}
+
+# Set by jig_ship_leave: the branch this checkout was moved to, or empty.
+# shellcheck disable=SC2034 # read by the callers (upgrade.sh)
+JIG_SHIP_BACK_ON=""
+
+# jig_ship_leave <who> <branch> <base> <sha> — after a merge this run made
+# (JIG_SHIP_MERGED=1), put this checkout back on <base>, bring <base> up to
+# origin's by fast-forward, and let <branch> go (jig_branch_leave) with <sha>,
+# the commit the forge merged at (`--match-head-commit`, `--sha`). Where this
+# checkout cannot leave the branch — <base> is checked out in another worktree,
+# or this checkout is a linked worktree, as it is when a task ships from its
+# own — the branch stays, local and remote, for housekeeping to take once the
+# task is purged: deleting origin's copy first would leave a squash-merged
+# local branch that `-d` refuses.
+jig_ship_leave() {
+  local who="$1" b="$2" base="$3" sha="$4" cur
+  JIG_SHIP_BACK_ON=""
+  [ "$JIG_SHIP_MERGED" = 1 ] || return 0
+  cfg_bool git.delete_merged_branches true || return 0
+  jig_branch_is_jigs "$b" || return 0
+  [ "$b" != "$base" ] || return 0
+  cur=$(git -C "$JIG_PROJECT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+  if [ "$cur" = "$b" ]; then
+    # A linked worktree is never moved: housekeeping finds a task's worktree
+    # by the branch git lists in it, and one switched to the base would be
+    # found by nothing and stay for good. Its branch waits for that cleanup.
+    if [ "$(jig_config_clone_root)" != "$JIG_PROJECT" ]; then
+      printf '%s: kept branch %s: it is checked out in this worktree; housekeeping deletes both once its task is closed\n' "$who" "$b"
+      return 0
+    fi
+    if ! git -C "$JIG_PROJECT" checkout -q "$base" >/dev/null 2>&1; then
+      printf '%s: kept branch %s: this checkout cannot switch to %s; housekeeping deletes it once its task is closed\n' "$who" "$b" "$base"
+      return 0
+    fi
+    # shellcheck disable=SC2034 # read by the callers (upgrade.sh)
+    JIG_SHIP_BACK_ON="$base"
+    jig_fetch_branches "$who" "$base"
+    if git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/remotes/origin/$base" >/dev/null 2>&1 \
+       && ! git -C "$JIG_PROJECT" merge --ff-only -q "refs/remotes/origin/$base" >/dev/null 2>&1; then
+      printf '%s: back on %s, which could not be fast-forwarded to origin/%s\n' "$who" "$base" "$base"
+    else
+      printf '%s: back on %s\n' "$who" "$base"
+    fi
+  fi
+  jig_branch_leave "$who" "$b" "$sha"
+}
+
 # --- specification links ------------------------------------------------------
 
 # jig_spec_link <task.md> — the spec id a task links to, or nothing.
@@ -1154,6 +1599,16 @@ jig_spec_epic() {
       if (found != "") print found
     }
   ' "$1"
+}
+
+# jig_tracked_changes — the tracked-and-uncommitted lines of
+# `git status --porcelain`, never the untracked ones (`??`): untracked files
+# are not work in progress (build output, a spec nobody started yet), only a
+# line git already tracks is. Shared by `task start` and `spec new`/`spec
+# resume`, which refuse a dirty tree by the same rule and must not drift
+# apart on what "dirty" means (design §6, ARCHITECTURE.md Scripts layout).
+jig_tracked_changes() {
+  git -C "$JIG_PROJECT" status --porcelain 2>/dev/null | grep -v '^??' || true
 }
 
 # Files this checkout has touched: the union of the diff against the merge-base
@@ -1305,14 +1760,157 @@ jig_knowledge_read_path() {
   esac
 }
 
-# Translate a frontmatter `paths` glob into a pattern usable both with
-# `find -path` and with a bash `case`: `**` (any depth, including zero
-# directories) collapses to a single `*`. BSD and GNU `find -path` match `*`
-# across `/` (no FNM_PATHNAME) and a `case` pattern does the same, so this one
-# substitution covers any-depth and single-segment globs in both consumers
-# (convention-shell). Used by context.sh, knowledge.sh.
+# Translate a frontmatter `paths` glob into a pattern with exactly one
+# wildcard token, `*` — schemas/frontmatter.md documents only `*` and `**`
+# ("any depth"); `?` and `[...]` were never part of this grammar. Escaping
+# them to literals first, rather than leaving them as bash `case` wildcards,
+# is what makes `jig_path_matches_any` (a `case` test) and
+# `jig_glob_matches_repo` (an ERE built from this same pattern) agree on a
+# glob containing one: a `case` pattern lets `?`/`[...]` through as glob
+# syntax unless escaped, and an early version of the ERE builder escaped them
+# to literal characters instead — two matchers disagreeing again on exactly
+# the class of glob item 5 existed to stop disagreeing on (review,
+# knowledge-costs-one-walk). No document uses either today, so this changes
+# nothing observable yet; it fixes the divergence before one does.
+#
+# `**` (any depth, including zero directories) collapses to a single `*`,
+# which matches across `/` the same way (no FNM_PATHNAME) (convention-shell).
+# A glob ending in `/` names a directory, and no path a matcher ever tests
+# against ends in `/` (a real file never does, and jig_repo_files below lists
+# files, not directory entries) — so it gains a trailing `*`, read as "anything
+# under here", the same reading `**` already gets for "any depth". The `**`
+# collapse runs before that check: testing for a trailing `/` first would turn
+# `docs/**/` into `docs/**/*`, a glob that — unlike plain `docs/**` or `docs/`
+# — no longer matches a file directly under `docs/` (review,
+# knowledge-costs-one-walk) instead of the `docs/*` both of those already
+# collapse to.
+#
+# Used by jig_path_matches_any and jig_glob_matches_repo below, the one
+# matcher context.sh and knowledge.sh both call.
 jig_glob_pattern() {
-  printf '%s' "$1" | sed 's#[*][*]/#*#g; s#[*][*]#*#g'
+  local pattern
+  pattern=$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/?/\\?/g; s/\[/\\[/g; s/\]/\\]/g')
+  pattern=$(printf '%s' "$pattern" | sed 's#[*][*]/#*#g; s#[*][*]#*#g')
+  case "$pattern" in
+    */) printf '%s*' "$pattern" ;;
+    *) printf '%s' "$pattern" ;;
+  esac
+}
+
+# --- glob matching (one matcher, shared by context.sh and knowledge.sh) -------
+#
+# There used to be two: a bash `case` loop over a file list, and a `find -path`
+# call per glob. They disagreed in three ways a review caught — `find` also
+# matches a directory *entry* (a glob over an otherwise-empty directory
+# "matched" through find and never through case), `find` does not consult
+# `.gitignore`, and the shared `**` substitution above never gave either of
+# them brace-glob support. Settling on one implementation, over one list built
+# by a tool that already understands ignore rules, ends all three: a document's
+# `paths` describes code, and code a glob only reaches through an empty
+# directory or an ignored file was never really described.
+
+# jig_path_matches_any <glob> <newline-files> — exit 0 when <glob> matches at
+# least one line of <files>. In-process (bash `case`, no subprocess per file):
+# a here-string, not `< <(printf ...)` — the latter forks a subshell *and* a
+# `printf` on every call, which is affordable once per task's touched files
+# but is exactly the per-glob subprocess cost this replaces `find` to avoid,
+# paid again, when the list is jig_repo_files instead (jig_glob_matches_repo,
+# every glob of every document).
+jig_path_matches_any() {
+  local glob="$1" files="$2" pattern file
+  pattern=$(jig_glob_pattern "$glob")
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    # shellcheck disable=SC2254
+    case "$file" in
+      $pattern) return 0 ;;
+    esac
+  done <<EOF
+$files
+EOF
+  return 1
+}
+
+# jig_repo_files — every path in the working tree a `paths` glob can describe:
+# tracked files, plus untracked ones `.gitignore` does not hide (the same rule
+# `jig_git_touched_files`'s untracked layer uses). One `git ls-files` per
+# process, NUL-separated and memoised — every glob check in the same command
+# shares this one walk instead of spawning `find` again.
+_JIG_REPO_FILES_LOADED=0
+_JIG_REPO_FILES=""
+jig_repo_files() {
+  if [ "$_JIG_REPO_FILES_LOADED" -eq 0 ]; then
+    _JIG_REPO_FILES=$( (
+      git -C "$JIG_PROJECT" ls-files -z
+      git -C "$JIG_PROJECT" ls-files -z --others --exclude-standard
+    ) | tr '\0' '\n' | sed '/^$/d' | LC_ALL=C sort -u)
+    _JIG_REPO_FILES_LOADED=1
+  fi
+  printf '%s\n' "$_JIG_REPO_FILES"
+}
+
+# jig_glob_matches_repo <glob> — exit 0 when <glob> matches at least one file
+# presently in the repository (jig_repo_files). Replaces a `find -path` call
+# per glob — one process that re-walks the whole tree — with one process
+# (`awk`) that tests every cached path from the one shared walk: the same
+# one-process-per-glob count `find` had, spent against memory instead of
+# disk. Goes through jig_glob_pattern first, the same conversion `case`
+# matching uses, rather than a second, awk-only translation of the glob: an
+# early version built the ERE straight from the raw glob and silently
+# stopped agreeing with jig_glob_pattern's `**/` handling — `**/*.sh` and
+# `*.sh` are the same case pattern (a bare `*` already matches across `/`),
+# but treating `**` and the `/` after it as two separate ERE tokens made the
+# slash mandatory, so a root-level `top.sh` stopped matching. One shared
+# conversion is worth the second process.
+#
+# Quits at the first match (`exit` inside the pattern rule) rather than
+# reading every path once one is already found. conventions/shell.md warns
+# against exactly this shape, `awk '{ ...; exit }'` — but for a *pipeline*,
+# where the awk quitting early can SIGPIPE a bash writer still mid-`printf`
+# and turn a match into a false failure under `pipefail`. This is a
+# here-document, not a pipe: there is no `cmd | awk` for `pipefail` to judge,
+# bash has already handed the whole list over before awk runs a line, and an
+# early `exit` here answers "found" the moment it is true instead of scanning
+# a repository's worth of paths that can no longer change the answer.
+#
+# Calls jig_repo_files as a plain command first, discarding its output, then
+# reads the global it fills directly — never `$(jig_repo_files)`: a command
+# substitution runs the function in a subshell, and the memoisation it sets
+# would vanish with that subshell instead of surviving to the next glob, which
+# is the one thing this function exists to avoid paying for twice.
+jig_glob_matches_repo() {
+  local pattern
+  jig_repo_files >/dev/null
+  pattern=$(jig_glob_pattern "$1")
+  awk -v g="$pattern" '
+    BEGIN {
+      pat = "^"
+      n = length(g)
+      for (i = 1; i <= n; i++) {
+        c = substr(g, i, 1)
+        # jig_glob_pattern backslash-escapes every `?`, `[`, `]` and literal
+        # `\` in the glob before this runs, so the char after one is always
+        # meant literally here too — never re-derived as "happens to be an
+        # ERE metachar", which is what let `?`/`[...]` slip through as
+        # wildcards in the `case` matcher while this builder quietly turned
+        # them into literals, the divergence item 5 asked to end (review,
+        # knowledge-costs-one-walk).
+        if (c == "\\" && i < n) {
+          i++
+          pat = pat "\\" substr(g, i, 1)
+          continue
+        }
+        if (c == "*") { pat = pat ".*"; continue }
+        if (index(".^$+?(){}|[]\\", c) > 0) { pat = pat "\\" c; continue }
+        pat = pat c
+      }
+      pat = pat "$"
+    }
+    $0 ~ pat { found = 1; exit }
+    END { exit !found }
+  ' <<EOF
+$_JIG_REPO_FILES
+EOF
 }
 
 # --- misc ------------------------------------------------------------------
@@ -1359,6 +1957,17 @@ _JIG_PAGE_DIRTY=""
 # SC2120 on a function that reads $1 when every call it can see passes none.
 # Always returns 0 and prints nothing: a failed redraw never changes the
 # output or the exit code of the command that triggered it.
+#
+# **This re-entry is not a session, and says so.** `bash "$jig" status
+# "$mode"` runs the whole dispatcher again, which would otherwise write this
+# checkout's own two records (adr-20260924-a-checkout-records-what-is-happening-in-it)
+# for `status --refresh` — overwriting `runtime/checkout`'s `command:` with
+# a line nobody ran, and, because `status` is one of the commands a reader
+# orients with, consuming the moved-HEAD notice a neighbour is owed. That
+# neighbour's next real orienting command must still get it, so the redraw's
+# subprocess carries JIG_INTERNAL_REDRAW, scoped to this one call by the
+# subshell it runs in, and checkout.sh's recorder and notice both stay silent
+# while it is set (jig_checkout_record, jig_checkout_notice).
 jig_status_page_touch() {
   local mode="--refresh" root jig
   [ "${1:-}" != --full ] || mode="--html"
@@ -1366,14 +1975,14 @@ jig_status_page_touch() {
   [ -f "$root/$JIG_AI_DIR/runtime/status.html" ] || return 0
   jig="$root/$JIG_AI_DIR/scripts/jig"
   [ -f "$jig" ] || return 0
-  (cd "$root" && bash "$jig" status "$mode") </dev/null >/dev/null 2>&1 || true
+  (cd "$root" && JIG_INTERNAL_REDRAW=1 bash "$jig" status "$mode") </dev/null >/dev/null 2>&1 || true
   return 0
 }
 
 # jig_status_page_dirty — note that this command changed something the page
-# shows. The writers call it themselves, so a new command that writes through
-# them is covered without anyone remembering to; jig_status_page_flush then
-# redraws once, however many writes came before.
+# shows. The writers call it themselves, through jig_record_changed below, so
+# a new command that writes through them is covered without anyone remembering
+# to; jig_status_page_flush then redraws once, however many writes came before.
 jig_status_page_dirty() { _JIG_PAGE_DIRTY=1; }
 
 # jig_status_page_flush — redraw the page when this command changed something.
@@ -1381,6 +1990,166 @@ jig_status_page_flush() {
   [ -n "${_JIG_PAGE_DIRTY:-}" ] || return 0
   _JIG_PAGE_DIRTY=""
   jig_status_page_touch --refresh
+}
+
+# --- the clone's revision (adr-20261016-the-clone-revision-is-a-claimed-name) ---
+#
+# One counter per clone, raised by every Jig write — task state, artifacts, the
+# autopilot journal, findings, the receipt, specs, knowledge, settings, a
+# housekeeping run — and reported as `revision` by every `--json` read (json.sh,
+# schemas/json.md). A consumer compares it between reads, and from
+# contract-queue on sends it back with a write.
+#
+# The value is the highest numeric **name** in `.ai/runtime/revision/` of the
+# clone's main checkout (jig_config_clone_root: every worktree raises and reads
+# the same one, ADR-0008 as amended 2026-09-25). Raising it claims the next
+# name with `mkdir <n+1>`: mkdir is atomic on POSIX and on NTFS under Git Bash
+# (CreateDirectoryW) alike, so of two writers that both saw <n> exactly one
+# creates <n+1> and the other gets EEXIST, reads again and claims <n+2>; a
+# claim made stale by a long stall is caught and made again (jig_revision_bump).
+# No increment is lost, and there is no lock to go stale, wait for or break. A
+# reader only lists names and never opens one. Not `mv <n> <n+1>`: Git Bash
+# emulates rename, and two writers both "renamed" the same <n> on Windows CI.
+#
+# A file edited by hand, or changed by a git command a person ran, raises
+# nothing: the accepted risk of the contract-extensions spec.
+
+# jig_revision_dir — where the counter lives; fails outside a project.
+jig_revision_dir() {
+  local root
+  [ -n "${JIG_PROJECT:-}" ] || return 1
+  root=$(jig_config_clone_root) || return 1
+  [ -n "$root" ] || return 1
+  printf '%s/%s/runtime/revision\n' "$root" "$JIG_AI_DIR"
+}
+
+# _jig_revision_scan <dir> — _JIG_REV <- the highest numeric name in <dir>, or
+# empty when there is none; _JIG_REV_OLD <- the other numeric names, which a
+# raise clears away. The shell's own glob, no process. A name is a directory
+# (a claim) or a file (the counter of the first, rename-based version, still
+# found in clones that ran it): either counts, and the highest wins.
+_JIG_REV=""
+_JIG_REV_OLD=""
+_jig_revision_scan() {
+  local f n
+  _JIG_REV=""
+  _JIG_REV_OLD=""
+  for f in "$1"/[0-9]*; do
+    n=${f##*/}
+    case "$n" in
+      '' | *[!0-9]*) continue ;;
+    esac
+    [ -e "$f" ] || continue
+    if [ -z "$_JIG_REV" ]; then
+      _JIG_REV=$n
+    elif [ "$n" -gt "$_JIG_REV" ]; then
+      _JIG_REV_OLD="$_JIG_REV_OLD $_JIG_REV"
+      _JIG_REV=$n
+    else
+      _JIG_REV_OLD="$_JIG_REV_OLD $n"
+    fi
+  done
+}
+
+# jig_revision_read — print the clone's revision: an integer, `0` when Jig has
+# not written anything in this clone yet (no counter).
+jig_revision_read() {
+  local dir
+  dir=$(jig_revision_dir) || { printf '0\n'; return 0; }
+  _JIG_REV=""
+  [ ! -d "$dir" ] || _jig_revision_scan "$dir"
+  printf '%s\n' "${_JIG_REV:-0}"
+}
+
+# _jig_revision_clear <dir> <below> <names> — remove the names in <names> that
+# are below <below>: best effort, at most 16 a time, never a failure. A reader
+# takes the highest name, so a leftover is clutter, not a wrong answer. Each
+# path is a digits-only name inside the revision directory (RULES.md: validated
+# before anything is removed).
+_jig_revision_clear() {
+  local dir="$1" below="$2" n count=0 dirs="" files=""
+  for n in $3; do
+    case "$n" in
+      '' | *[!0-9]*) continue ;;
+    esac
+    [ "$n" -lt "$below" ] || continue
+    [ "$count" -lt 16 ] || break
+    count=$((count + 1))
+    if [ -d "$dir/$n" ]; then
+      dirs="$dirs $n"
+    elif [ -f "$dir/$n" ]; then
+      files="$files $n"
+    fi
+  done
+  # shellcheck disable=SC2086 # digits-only names, split on purpose
+  if [ -n "$dirs" ]; then (cd "$dir" && rmdir $dirs) 2>/dev/null || true; fi
+  # shellcheck disable=SC2086 # digits-only names, split on purpose
+  if [ -n "$files" ]; then (cd "$dir" && rm -f $files) 2>/dev/null || true; fi
+  return 0
+}
+
+# How far below a claim a name must be before a raise clears it. A name is
+# cleared only by a claim more than this above it, so a claim that finds the
+# highest name that far above itself is a cleared name created again.
+_JIG_REV_KEEP=16
+
+# jig_revision_bump — raise the clone's revision by one, after a write landed.
+#
+# Claim the name above the highest one seen; a claim that loses (EEXIST) reads
+# again. A claim can also *succeed stale*: a writer that read <n> (or found the
+# directory empty and seeded), stalled, and meanwhile others claimed <n+1> and
+# far beyond and cleared it, would create <n+1> again — below the counter,
+# counting nothing. Clearing <n+1> took a claim more than _JIG_REV_KEEP above
+# it, and the highest name never goes down, so after its mkdir every claim
+# reads again: a highest name more than _JIG_REV_KEEP above its own makes it
+# stale, and it is withdrawn and made again. A fresh claim is misjudged only if
+# that many raises land between its mkdir and the next read, microseconds
+# apart — and then it counts once too often, never too few.
+#
+# A first write (or the first after `.ai/runtime` was lost) claims the current
+# time in seconds rather than 1, so that a revision a consumer still holds from
+# before the loss does not come round again. Never fails the command: the write
+# it follows has already landed, so a counter that cannot be raised — the main
+# checkout not writable from a sandboxed worktree — is a warning.
+jig_revision_bump() {
+  local dir tries=0 next seen old
+  dir=$(jig_revision_dir) || return 0
+  if [ ! -d "$dir" ] && ! mkdir -p "$dir" 2>/dev/null; then
+    jig_warn "could not raise the clone revision: cannot create $dir"
+    return 0
+  fi
+  while [ "$tries" -lt 64 ]; do
+    tries=$((tries + 1))
+    _jig_revision_scan "$dir"
+    seen=$_JIG_REV
+    old="$_JIG_REV_OLD $_JIG_REV"
+    if [ -z "$seen" ]; then
+      next=$(date +%s)
+    else
+      next=$((seen + 1))
+    fi
+    # The claim: exactly one writer creates <next>; the loser reads again.
+    mkdir "$dir/$next" 2>/dev/null || continue
+    _jig_revision_scan "$dir"
+    if [ "${_JIG_REV:-$next}" -le "$((next + _JIG_REV_KEEP))" ]; then
+      _jig_revision_clear "$dir" "$((next - _JIG_REV_KEEP))" "$old"
+      return 0
+    fi
+    # Stale: <next> had been claimed and cleared before. Withdraw it.
+    rmdir "$dir/$next" 2>/dev/null || true
+  done
+  jig_warn "could not raise the clone revision in $dir; a reader may miss this change"
+  return 0
+}
+
+# jig_record_changed — a Jig write landed: raise the clone's revision now, and
+# redraw the status page once when the command ends (jig_status_page_dirty).
+# Every writer of a record calls it right after its write lands, not once at
+# the command's end: a write made inside `$(...)`, or by a command that dies
+# after it, is still counted. tests/json.t.sh fails on a writer that does not.
+jig_record_changed() {
+  jig_revision_bump
+  jig_status_page_dirty
 }
 
 # jig_hash_git_dir — the git directory every hash in this project is computed
@@ -1584,3 +2353,131 @@ jig_git_change_rows() (
   done
   LC_ALL=C sort -u "$JIG_CHANGE_TMP/rows"
 )
+
+# --- the verify run record, read ---------------------------------------------
+#
+# `jig verify` holds one record per clone while it runs (verify.sh, "one run per
+# clone"). Reading it is shared here because `jig upgrade` asks the same
+# question before it replaces the scripts a run in this checkout is executing,
+# and one command library never sources another (ARCHITECTURE.md).
+
+# jig_verify_busy_dir — where the record lives, or nothing.
+#
+# The clone's main checkout, which `jig_config_clone_root` already computes by
+# reading git's own files — one answer from every worktree, no `git` process.
+# ADR-0038 made reading there a named exception to ADR-0008; this extends it to
+# writing, because what is being protected belongs to no checkout: the CPU is
+# one per clone, and the eight runs were in eight different worktrees.
+jig_verify_busy_dir() {
+  local root
+  root=$(jig_config_clone_root) || return 1
+  [ -n "$root" ] || return 1
+  printf '%s/%s/runtime/verify\n' "$root" "$JIG_AI_DIR"
+}
+
+# jig_verify_busy_ttl — how long a record still counts, in seconds. `0` is a
+# duration the grammar already spells, and it switches the whole mechanism off:
+# the escape for someone who genuinely wants parallel local runs, without a new
+# flag to learn.
+#
+# One key with a working default, never one a person must fill. The duration
+# grammar is the framework's one (`jig_duration_seconds`), and a mistyped value
+# leaves the default standing rather than taking `jig verify` down.
+jig_verify_busy_ttl() {
+  local raw seconds
+  raw=$(cfg verify.busy_ttl "30m")
+  seconds=$(jig_duration_seconds "$raw" 2>/dev/null) || seconds=""
+  case "$seconds" in
+    '' | *[!0-9]*) seconds=1800 ;;
+  esac
+  printf '%s\n' "$seconds"
+}
+
+# _jig_verify_busy_mtime <file> — the file's mtime in seconds, or nothing.
+#
+# The BSD-then-GNU pair the session hook and the checkout record use, but
+# **chosen on the value, never on the exit status** — and that distinction is
+# the whole of this comment, because getting it wrong silently disabled the
+# lock on every GNU system.
+#
+# `stat -f '%m' <file>` under GNU coreutils does not simply fail: `-f` means
+# --file-system, so `%m` is read as a FILE operand, which errors, and then the
+# real file prints a **file-system block on stdout**. The command exits
+# non-zero, so `cmd && return 0` falls through to the GNU form and appends the
+# real mtime to that block. The caller then holds several lines where it
+# expected a number, rejects them, and reads the record's holder as gone: on
+# Linux and in Git Bash the record was never once seen as live, and
+# `jig verify` never waited for anything. It passed on macOS, where BSD stat
+# answers the first form, which is exactly how it reached CI.
+#
+# `_jig_checkout_mtimes` survives the same idiom only because it reads its
+# output line by line and skips what is not numeric. This reads one file, so it
+# checks the value it got instead.
+_jig_verify_busy_mtime() {
+  local out
+  out=$(stat -f '%m' "$1" 2>/dev/null) || out=""
+  case "$out" in
+    '' | *[!0-9]*) out=$(stat -c '%Y' "$1" 2>/dev/null) || out="" ;;
+  esac
+  case "$out" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  printf '%s\n' "$out"
+}
+
+# _jig_verify_busy_value <file> <key> — the first `<key>: <value>` line, read by the
+# shell alone. The CR is stripped explicitly because `read` keeps one where sed
+# would not, and this record may be written under Windows.
+_jig_verify_busy_value() {
+  local file="$1" key="$2" line
+  [ -f "$file" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
+    case "$line" in
+      "$key: "*)
+        printf '%s\n' "${line#"$key": }"
+        return 0
+        ;;
+    esac
+  done < "$file"
+  return 1
+}
+
+# jig_verify_busy_holder <dir> <ttl> — "<age in seconds> <checkout>" when a live
+# run holds the record, nothing when none does.
+#
+# Two independent tests, and the record is live only when both pass:
+#
+#   1. `kill -0 <pid>` — a shell builtin, not `ps`, which ADR-0002 rules out
+#      and which behaves differently under Git Bash anyway. This is the normal
+#      path: a run killed by the sandbox gives the clone back at the next poll,
+#      and that is exactly the death this task was written about.
+#   2. the record's mtime is within the ttl — the backstop for when (1) is
+#      wrong: another user's process reads as dead (EPERM), a recycled pid
+#      reads as alive. Both errors are bounded. "Wrongly dead" is today's
+#      behaviour; "wrongly alive" waits no longer than the ttl.
+#
+# A record with no readable pid falls back to the ttl alone, so a torn read can
+# only cost a wait, never a wrong start.
+jig_verify_busy_holder() {
+  local dir="$1" ttl="$2" file mtime now age pid checkout
+  file="$dir/busy/run"
+  [ -f "$file" ] || return 1
+  mtime=$(_jig_verify_busy_mtime "$file") || return 1
+  case "$mtime" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  now=$(date +%s)
+  if [ "$now" -lt "$mtime" ]; then age=0; else age=$((now - mtime)); fi
+  [ "$age" -le "$ttl" ] || return 1
+  pid=$(_jig_verify_busy_value "$file" pid) || pid=""
+  case "$pid" in
+    '' | *[!0-9]*) ;;
+    "$$") return 1 ;;
+    *) kill -0 "$pid" 2>/dev/null || return 1 ;;
+  esac
+  checkout=$(_jig_verify_busy_value "$file" checkout) || checkout=""
+  [ -n "$checkout" ] || checkout="another checkout"
+  printf '%s %s\n' "$age" "$checkout"
+}
+
